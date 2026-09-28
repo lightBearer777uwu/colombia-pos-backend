@@ -1,15 +1,18 @@
 const express = require('express');
 const app = express();
 
+// Initialize Stripe for NFC Terminal tokens
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+
 app.use(express.json());
 
-// 1. Endpoint called by your mobile app to initiate a transaction
+// ==========================================
+// 1. WOMPI PAYMENT ENDPOINT (Nequi, QR, etc.)
+// ==========================================
 app.post('/api/transactions', async (req, res) => {
   const { amount, currency, reference, paymentSourceId } = req.body;
-
   try {
-    const wompiPrivateKey = process.env.WOMPI_PRIVATE_KEY; 
-
+    const wompiPrivateKey = process.env.WOMPI_PRIVATE_KEY;
     const wompiResponse = await fetch('https://production.wompi.co/v1/transactions', {
       method: 'POST',
       headers: {
@@ -25,9 +28,7 @@ app.post('/api/transactions', async (req, res) => {
         payment_source_id: paymentSourceId,
       }),
     });
-
     const data = await wompiResponse.json();
-    
     if (wompiResponse.ok) {
       return res.status(201).json({ success: true, data: data.data });
     } else {
@@ -39,23 +40,17 @@ app.post('/api/transactions', async (req, res) => {
   }
 });
 
-// 2. Webhook Endpoint: Listens for asynchronous payment confirmations from Wompi/Banks
-app.post('/api/webhooks/wompi', (req, res) => {
-  const event = req.body;
-
-  if (event.event === 'transaction.updated') {
-    const transaction = event.data.transaction;
-    const status = transaction.status; 
-    const reference = transaction.reference;
-
-    console.log(`Webhook received! Transaction ${reference} is now: ${status}`);
-
-    if (status === 'APPROVED') {
-      // Logic when payment clears successfully
-    }
+// ==========================================
+// 2. STRIPE TERMINAL CONNECTION TOKEN (NFC Tap-to-Pay)
+// ==========================================
+app.post('/connectionToken', async (req, res) => {
+  try {
+    const connectionToken = await stripe.terminal.connectionTokens.create();
+    res.json({ secret: connectionToken.secret });
+  } catch (error) {
+    console.error('Stripe Terminal Error:', error);
+    res.status(500).send({ error: error.message });
   }
-
-  return res.status(200).send('Webhook received successfully');
 });
 
 const PORT = process.env.PORT || 3000;
