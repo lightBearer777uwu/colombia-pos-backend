@@ -5,7 +5,48 @@ const app = express();
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 app.use(express.json());
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
+// Step 1: Create a new Express connected account for a vendor
+app.post('/create-connected-account', async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    const account = await stripe.accounts.create({
+      type: 'express',
+      country: 'CO', // Set to Colombia or the relevant country code
+      email: email,
+      capabilities: {
+        card_payments: { requested: true },
+        transfers: { requested: true },
+      },
+    });
+
+    res.json({ accountId: account.id });
+  } catch (error) {
+    console.error('Error creating account:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Step 2: Generate a secure Stripe-hosted onboarding link
+app.post('/create-account-link', async (req, res) => {
+  try {
+    const { accountId } = req.body;
+
+    const accountLink = await stripe.accountLinks.create({
+      account: accountId,
+      refresh_url: 'https://colombia-pos-backend.onrender.com/onboarding-refresh',
+      return_url: 'https://colombia-pos-backend.onrender.com/onboarding-complete',
+      type: 'account_onboarding',
+    });
+
+    res.json({ url: accountLink.url });
+  } catch (error) {
+    console.error('Error creating account link:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
 // ==========================================
 // 1. WOMPI PAYMENT ENDPOINT (Nequi, QR, etc.)
 // ==========================================
