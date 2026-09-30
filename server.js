@@ -5,7 +5,6 @@ const app = express();
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 app.use(express.json());
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 // Step 1: Create a new Express connected account for a vendor
 app.post('/create-connected-account', async (req, res) => {
