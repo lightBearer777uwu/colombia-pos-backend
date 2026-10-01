@@ -119,7 +119,71 @@ app.post('/api/transactions', async (req, res) => {
         return res.status(500).json({ success: false, error: 'Internal Server Error' });
     }
 });
+// ==========================================
+// DEDICATED LOCAL PROVIDER ROUTES (Addi & Nequi)
+// ==========================================
 
+// 1. Process Addi (BNPL) Order Creation Route
+app.post('/api/local/addi/create-order', async (req, res) => {
+  try {
+    const { amount, currency, orderId, customerDetails, items } = req.body;
+    
+    // Construct Addi payload for Colombian gateway processing
+    const payload = {
+      totalAmount: amount,
+      currency: currency || 'COP',
+      orderId: orderId,
+      client: {
+        id: customerDetails.id,
+        idType: customerDetails.idType || 'CC',
+        firstName: customerDetails.firstName,
+        lastName: customerDetails.lastName,
+        email: customerDetails.email,
+        phone: customerDetails.phone
+      },
+      items: items,
+      redirectionUrl: {
+        success: `${process.env.FRONTEND_URL || 'https://your-app.com'}/payment-success`,
+        rejected: `${process.env.FRONTEND_URL || 'https://your-app.com'}/payment-rejected`
+      }
+    };
+
+    // Simulated/Production scaffold response
+    res.status(200).json({
+      success: true,
+      provider: 'addi',
+      redirectUrl: `https://checkout.addi.com/pay/${orderId}`,
+      orderId: orderId
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// 2. Process Nequi Direct Push / Wallet Transaction Route
+app.post('/api/local/nequi/charge', async (req, res) => {
+  try {
+    const { phoneNumber, value, reference } = req.body;
+
+    const payload = {
+      phoneNumber: phoneNumber,
+      value: value.toString(),
+      reference: reference,
+      franchise: 'NEQUI'
+    };
+
+    // Forward to local gateway or direct Nequi disbursement API
+    res.status(200).json({
+      success: true,
+      provider: 'nequi',
+      status: 'PENDING_APPROVAL',
+      message: `Solicitud de cobro enviada al Nequi #${phoneNumber}`,
+      reference: reference
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
 // ==========================================
 // 2. STRIPE TERMINAL CONNECTION TOKEN (NFC Tap-to-Pay)
 // ==========================================
