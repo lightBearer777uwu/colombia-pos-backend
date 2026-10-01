@@ -3,7 +3,47 @@ const app = express();
 
 // Initialize Stripe for payments and terminals
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+// ==========================================
+// STRIPE WEBHOOK HANDLER (MUST be before express.json())
+// ==========================================
+app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
 
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error(`Webhook signature verification failed: ${err.message}`);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  switch (event.type) {
+    case 'checkout.session.completed':
+      const session = event.data.object;
+      console.log(`Checkout Session Completed! ID: ${session.id}`);
+      break;
+
+    case 'invoice.paid':
+      const invoice = event.data.object;
+      console.log(`Invoice Paid Successfully! ID: ${invoice.id}`);
+      break;
+
+    case 'invoice.payment_failed':
+      const failedInvoice = event.data.object;
+      console.log(`Payment Failed for Invoice: ${failedInvoice.id}`);
+      break;
+
+    case 'customer.subscription.deleted':
+      const subscription = event.data.object;
+      console.log(`Subscription Cancelled/Ended: ${subscription.id}`);
+      break;
+
+    default:
+      console.log(`Unhandled event type ${event.type}`);
+  }
+
+  res.json({ received: true });
+});
 app.use(express.json());
 
 // Step 1: Create a new Express connected account for a vendor
