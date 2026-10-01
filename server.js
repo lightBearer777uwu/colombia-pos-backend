@@ -150,7 +150,37 @@ app.post('/create-account-link', async (req, res) => {
         res.status(500).send({ error: error.message });
     }
 });
+// ==========================================
+// 5. STRIPE SUBSCRIPTION CHECKOUT SESSION ENDPOINT
+// ==========================================
+app.post('/create-checkout-session', async (req, res) => {
+  try {
+    const session = await stripe.checkout.sessions.create({
+      ui_mode: 'hosted_page',
+      mode: 'subscription',
+      billing_address_collection: 'auto',
+      phone_number_collection: { enabled: true },
+      automatic_tax: { enabled: false },
+      allow_promotion_codes: false,
+      payment_method_collection: 'always',
+      submit_type: 'auto',
+      name_collection: {
+        individual: { enabled: true, optional: true },
+        business: { enabled: true, optional: true }
+      },
+      integration_identifier: 'hosted_mobile_app_0001',
+      origin_context: 'mobile_app',
+      success_url: `${process.env.DOMAIN}/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.DOMAIN}`,
+      line_items: [{ price: 'price_1ULXHo4DzROVKhPKK29fyWTv', quantity: 1 }], // Replace with your actual Stripe Price ID for the 50k COP product
+    });
 
+    res.json({ url: session.url });
+  } catch (error) {
+    console.error('Error creating checkout session:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`Backend server running on port ${PORT}`);
