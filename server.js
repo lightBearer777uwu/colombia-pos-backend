@@ -159,30 +159,6 @@ app.post('/api/local/addi/create-order', async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
-/// --- NEQUI QR CODE GENERATION ENDPOINT ---
-app.post('/api/local/nequi/qr', async (req, res) => {
-  try {
-    const { value, reference } = req.body;
-
-    console.log(`Generating Nequi QR for Value: ${value}, Reference: ${reference}`);
-
-    // For now, we return a valid payload/string that your frontend can process
-    return res.status(200).json({
-      success: true,
-      message: 'QR Code generated successfully',
-      qrCode: `NEQUI-QR-PAYLOAD-${reference}-${value}`,
-      reference: reference,
-      value: value
-    });
-
-  } catch (error) {
-    console.error('Error generating Nequi QR:', error.message);
-    return res.status(500).json({
-      success: false,
-      error: error.message || 'Internal server error during QR generation'
-    });
-  }
-});
 // 2. Process Nequi Direct Push / Wallet Transaction Route
 app.post('/api/local/nequi/charge', async (req, res) => {
   try {
@@ -208,7 +184,7 @@ app.post('/api/local/nequi/charge', async (req, res) => {
         message: `[Mock] Solicitud enviada al Nequi #${phoneNumber}. Configure las credenciales en Render para habilitar producción.`,
         reference: reference
       });
-    
+    }
 
     // 2. Request OAuth2 Access Token from Nequi / Gateway Auth Server
     const authResponse = await fetch('https://api.nequi.com/v1/security/oauth/token', {
@@ -221,12 +197,13 @@ app.post('/api/local/nequi/charge', async (req, res) => {
     });
 
     const authData = await authResponse.json();
-    if (!authResponse.ok) {
-      throw new Error(`Nequi Authentication Failed: ${JSON.stringify(authData)}`);
-    }
     const accessToken = authData.access_token;
 
-    // 3. Dispatch the real Push Payment request to the Nequi API Gateway
+    if (!accessToken) {
+      return res.status(500).json({ success: false, error: 'Failed to authenticate with Nequi API' });
+    }
+
+    // 3. Request Push Notification / Payment
     const nequiResponse = await fetch('https://api.nequi.com/v1/services/payments/push', {
       method: 'POST',
       headers: {
