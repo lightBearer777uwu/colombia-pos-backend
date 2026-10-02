@@ -159,16 +159,12 @@ app.post('/api/local/addi/create-order', async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
-// --- NEQUI QR CODE GENERATION ENDPOINT ---
+/// --- NEQUI QR CODE GENERATION ENDPOINT ---
 app.post('/api/local/nequi/qr', async (req, res) => {
   try {
     const { value, reference } = req.body;
 
     console.log(`Generating Nequi QR for Value: ${value}, Reference: ${reference}`);
-
-    // TODO: If you are integrating directly with Nequi's official API or an aggregator 
-    // like Wompi / Openpay, make your server-side API call here.
-    // Example: const nequiResponse = await axios.post('...', { amount: value, ... });
 
     // For now, we return a valid payload/string that your frontend can process
     return res.status(200).json({
