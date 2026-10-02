@@ -159,29 +159,109 @@ app.post('/api/local/addi/create-order', async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
+// --- NEQUI QR CODE GENERATION ENDPOINT ---
+app.post('/api/local/nequi/qr', async (req, res) => {
+  try {
+    const { value, reference } = req.body;
 
+    console.log(`Generating Nequi QR for Value: ${value}, Reference: ${reference}`);
+
+    // TODO: If you are integrating directly with Nequi's official API or an aggregator 
+    // like Wompi / Openpay, make your server-side API call here.
+    // Example: const nequiResponse = await axios.post('...', { amount: value, ... });
+
+    // For now, we return a valid payload/string that your frontend can process
+    return res.status(200).json({
+      success: true,
+      message: 'QR Code generated successfully',
+      qrCode: `NEQUI-QR-PAYLOAD-${reference}-${value}`,
+      reference: reference,
+      value: value
+    });
+
+  } catch (error) {
+    console.error('Error generating Nequi QR:', error.message);
+    return res.status(500).json({
+      success: false,
+      error: error.message || 'Internal server error during QR generation'
+    });
+  }
+});
 // 2. Process Nequi Direct Push / Wallet Transaction Route
 app.post('/api/local/nequi/charge', async (req, res) => {
   try {
     const { phoneNumber, value, reference } = req.body;
 
-    const payload = {
-      phoneNumber: phoneNumber,
-      value: value.toString(),
-      reference: reference,
-      franchise: 'NEQUI'
-    };
+    // Validate that required fields are present
+    if (!phoneNumber || !value) {
+      return res.status(400).json({ success: false, error: 'Phone number and value are required' });
+    }
 
-    // Forward to local gateway or direct Nequi disbursement API
-    res.status(200).json({
-      success: true,
-      provider: 'nequi',
-      status: 'PENDING_APPROVAL',
-      message: `Solicitud de cobro enviada al Nequi #${phoneNumber}`,
-      reference: reference
+    // 1. Check if the environment variables are set yet
+    const clientId = process.env.NEQUI_CLIENT_ID;
+    const clientSecret = process.env.NEQUI_CLIENT_SECRET;
+    const apiKey = process.env.NEQUI_API_KEY;
+
+    // If credentials haven't been provided by the vendor yet, fall back gracefully to a pending mock response
+    if (!clientId || !clientSecret) {
+      console.log(`[NEQUI MOCK MODE] Charge requested for phone: ${phoneNumber}, amount: $${value}`);
+      return res.status(200).json({
+        success: true,
+        provider: 'nequi',
+        status: 'PENDING_APPROVAL',
+        message: `[Mock] Solicitud enviada al Nequi #${phoneNumber}. Configure las credenciales en Render para habilitar producción.`,
+        reference: reference
+      });
+    
+
+    // 2. Request OAuth2 Access Token from Nequi / Gateway Auth Server
+    const authResponse = await fetch('https://api.nequi.com/v1/security/oauth/token', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Basic ' + Buffer.from(`${clientId}:${clientSecret}`).toString('base64')
+      },
+      body: JSON.stringify({ grant_type: 'client_credentials' })
     });
+
+    const authData = await authResponse.json();
+    if (!authResponse.ok) {
+      throw new Error(`Nequi Authentication Failed: ${JSON.stringify(authData)}`);
+    }
+    const accessToken = authData.access_token;
+
+    // 3. Dispatch the real Push Payment request to the Nequi API Gateway
+    const nequiResponse = await fetch('https://api.nequi.com/v1/services/payments/push', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${accessToken}`,
+        'X-API-Key': apiKey
+      },
+      body: JSON.stringify({
+        phoneNumber: phoneNumber,
+        value: value.toString(),
+        reference: reference,
+        franchise: 'NEQUI'
+      })
+    });
+
+    const nequiResult = await nequiResponse.json();
+
+    if (nequiResponse.ok) {
+      return res.status(200).json({
+        success: true,
+        provider: 'nequi',
+        status: 'SUCCESS',
+        data: nequiResult
+      });
+    } else {
+      return res.status(400).json({ success: false, error: nequiResult });
+    }
+
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    console.error('Nequi API Error:', error);
+    return res.status(500).json({ success: false, error: error.message });
   }
 });
 // ==========================================
