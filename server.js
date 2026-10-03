@@ -159,6 +159,26 @@ app.post('/api/local/addi/create-order', async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
+// Process Nequi QR Code Generation Route
+app.post('/api/local/nequi/qr', async (req, res) => {
+  try {
+    const { value, reference } = req.body;
+    
+    if (!value) {
+      return res.status(400).json({ success: false, error: 'Value is required' });
+    }
+
+    // Return a mock or real QR code response depending on your Nequi API setup
+    return res.status(200).json({
+      success: true,
+      qrCode: `NEQUI-QR-DATA-${reference || Date.now()}`,
+      value: value
+    });
+  } catch (error) {
+    console.error('Nequi QR Error:', error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
 // 2. Process Nequi Direct Push / Wallet Transaction Route
 app.post('/api/local/nequi/charge', async (req, res) => {
   try {
