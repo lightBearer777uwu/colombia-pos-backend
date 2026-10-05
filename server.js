@@ -68,12 +68,6 @@ app.post('/create-connected-account', async (req, res) => {
   }
 });
 
-    res.json({ accountId: account.id });
-  } catch (error) {
-    console.error('Error creating account:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
 
 // Step 2: Generate a secure Stripe-hosted onboarding link
 app.post('/create-account-link', async (req, res) => {
