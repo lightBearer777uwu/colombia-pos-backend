@@ -52,12 +52,12 @@ app.post('/create-connected-account', async (req, res) => {
     const { email } = req.body;
 
     const account = await stripe.accounts.create({
-      dashboard: 'express', // Replaces the legacy 'type: express'
+      dashboard: 'express',
       country: 'CO',
       email: email,
       defaults: {
         responsibilities: {
-          losses_collector: 'stripe', // Sets losses collector to Stripe as required
+          losses_collector: 'stripe',
         },
       },
       capabilities: {
