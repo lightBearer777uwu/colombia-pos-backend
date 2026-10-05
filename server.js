@@ -46,21 +46,27 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
 });
 app.use(express.json());
 
-// Step 1: Create a new Express connected account for a vendor (Accounts v2)
-/ Step 1: Create a new Express connected account for a vendor
+// Step 1: Create a new Express connected account for a vendor
 app.post('/create-connected-account', async (req, res) => {
   try {
     const { email } = req.body;
 
     const account = await stripe.accounts.create({
-      type: 'express', // Supported in your current stripe package version
-      country: 'CO', 
+      type: 'express',
+      country: 'CO',
       email: email,
       capabilities: {
         card_payments: { requested: true },
         transfers: { requested: true },
       },
     });
+
+    res.json({ accountId: account.id });
+  } catch (error) {
+    console.error('Error creating account:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
 
     res.json({ accountId: account.id });
   } catch (error) {
