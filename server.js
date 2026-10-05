@@ -52,14 +52,13 @@ app.post('/create-connected-account', async (req, res) => {
     const { email } = req.body;
 
     const account = await stripe.accounts.create({
-      dashboard: 'express',
+      controller: {
+        stripe_dashboard: { type: 'express' },
+        fees: { payer: 'application' },
+        losses: { payments: 'application' },
+      },
       country: 'CO',
       email: email,
-      defaults: {
-        responsibilities: {
-          losses_collector: 'stripe',
-        },
-      },
       capabilities: {
         card_payments: { requested: true },
         transfers: { requested: true },
