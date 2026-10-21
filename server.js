@@ -48,7 +48,6 @@ app.post('/create-connected-account', async (req, res) => {
 
     const account = await stripe.accounts.create({
       type: 'standard',
-      country: 'CO',
       email: email || 'vendor@moto-spa.com',
     });
 
