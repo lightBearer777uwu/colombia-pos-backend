@@ -51,7 +51,7 @@ app.post('/create-connected-account', async (req, res) => {
       email: email || 'vendor@moto-spa.com',
       controller: {
         losses: {
-          payments: 'stripe',
+          payments: 'application',
         },
         fees: {
           payer: 'application',
