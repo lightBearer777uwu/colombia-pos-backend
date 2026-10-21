@@ -47,23 +47,9 @@ app.post('/create-connected-account', async (req, res) => {
     const { email } = req.body;
 
     const account = await stripe.accounts.create({
+      type: 'standard',
       country: 'CO',
       email: email || 'vendor@moto-spa.com',
-      controller: {
-        losses: {
-          payments: 'application',
-        },
-        fees: {
-          payer: 'application',
-        },
-        stripe_dashboard: {
-          type: 'express',
-        },
-      },
-      capabilities: {
-        card_payments: { requested: true },
-        transfers: { requested: true },
-      },
     });
 
     res.json({ accountId: account.id });
