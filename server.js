@@ -41,15 +41,25 @@ app.use(express.json());
 // 1. STRIPE CONNECTED ACCOUNTS & ONBOARDING (v1 API)
 // ==========================================
 
-// Step 1: Create a new Express connected account using Stripe v1 API
+// Step 1: Create a new connected account using Stripe Accounts API
 app.post('/create-connected-account', async (req, res) => {
   try {
     const { email } = req.body;
 
     const account = await stripe.accounts.create({
-      type: 'express',
       country: 'CO',
       email: email || 'vendor@moto-spa.com',
+      controller: {
+        losses: {
+          payments: 'stripe',
+        },
+        fees: {
+          payer: 'application',
+        },
+        stripe_dashboard: {
+          type: 'express',
+        },
+      },
       capabilities: {
         card_payments: { requested: true },
         transfers: { requested: true },
