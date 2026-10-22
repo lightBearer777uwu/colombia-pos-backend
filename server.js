@@ -81,42 +81,18 @@ app.post('/create-account-link', async (req, res) => {
 // Route handler for Onboarding Refresh (when switching languages or refreshing Stripe page)
 app.get('/onboarding-refresh', async (req, res) => {
   try {
-    const accountId = req.query.accountId;
-    if (accountId) {
-      const accountLink = await stripe.accountLinks.create({
-        account: accountId,
-        refresh_url: `https://colombia-pos-backend.onrender.com/onboarding-refresh?accountId=${accountId}`,
-        return_url: 'https://colombia-pos-backend.onrender.com/onboarding-complete',
-        type: 'account_onboarding',
-      });
-      return res.redirect(accountLink.url);
-    }
+    const targetAccount = req.query.accountId || 'acct_1UKnEG4DZRScEfeV';
+    const accountLink = await stripe.accountLinks.create({
+      account: targetAccount,
+      refresh_url: `https://colombia-pos-backend.onrender.com/onboarding-refresh?accountId=${targetAccount}`,
+      return_url: 'https://colombia-pos-backend.onrender.com/onboarding-complete',
+      type: 'account_onboarding',
+    });
+    return res.redirect(accountLink.url);
   } catch (error) {
     console.error('Error in onboarding-refresh:', error);
+    res.status(500).send('Error refreshing onboarding session.');
   }
-
-  res.send(`
-    <!DOCTYPE html>
-    <html>
-      <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>MOTO SPA S.S - Registro Stripe</title>
-        <style>
-          body { font-family: system-ui, -apple-system, sans-serif; background: #0f172a; color: #f8fafc; text-align: center; padding: 40px 20px; }
-          .card { background: #1e293b; max-width: 420px; margin: 0 auto; padding: 30px; border-radius: 16px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }
-          h2 { color: #a855f7; margin-bottom: 10px; }
-          p { color: #94a3b8; font-size: 15px; line-height: 1.5; }
-        </style>
-      </head>
-      <body>
-        <div class="card">
-          <h2>MOTO SPA S.S</h2>
-          <p>La sesión de configuración se ha actualizado. Regresa a la aplicación para reintentar la configuración bancaria de Stripe.</p>
-        </div>
-      </body>
-    </html>
-  `);
 });
 
 // Route handler for Onboarding Complete
