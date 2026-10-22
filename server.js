@@ -45,11 +45,15 @@ app.use(express.json());
 app.post('/create-connected-account', async (req, res) => {
   try {
     const { email } = req.body;
-
-    const account = await stripe.accounts.create({
+    const accountParams = {
       type: 'standard',
-      email: email || 'vendor@moto-spa.com',
-    });
+    };
+
+    if (email && typeof email === 'string' && email.trim() !== '' && !email.includes('vendor@moto-spa.com')) {
+      accountParams.email = email.trim();
+    }
+
+    const account = await stripe.accounts.create(accountParams);
 
     res.json({ accountId: account.id });
   } catch (error) {
@@ -85,7 +89,6 @@ app.get('/onboarding-refresh', async (req, res) => {
     if (!accountId) {
       const newAccount = await stripe.accounts.create({
         type: 'standard',
-        email: 'vendor@moto-spa.com',
       });
       accountId = newAccount.id;
     }
