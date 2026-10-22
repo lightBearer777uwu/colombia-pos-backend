@@ -66,7 +66,7 @@ app.post('/create-account-link', async (req, res) => {
 
     const accountLink = await stripe.accountLinks.create({
       account: targetAccount,
-      refresh_url: 'https://colombia-pos-backend.onrender.com/onboarding-refresh',
+      refresh_url: `https://colombia-pos-backend.onrender.com/onboarding-refresh?accountId=${targetAccount}`,
       return_url: 'https://colombia-pos-backend.onrender.com/onboarding-complete',
       type: 'account_onboarding',
     });
@@ -76,6 +76,103 @@ app.post('/create-account-link', async (req, res) => {
     console.error('Error creating account link:', error);
     res.status(500).json({ error: error.message });
   }
+});
+
+// Route handler for Onboarding Refresh (when switching languages or refreshing Stripe page)
+app.get('/onboarding-refresh', async (req, res) => {
+  try {
+    const accountId = req.query.accountId;
+    if (accountId) {
+      const accountLink = await stripe.accountLinks.create({
+        account: accountId,
+        refresh_url: `https://colombia-pos-backend.onrender.com/onboarding-refresh?accountId=${accountId}`,
+        return_url: 'https://colombia-pos-backend.onrender.com/onboarding-complete',
+        type: 'account_onboarding',
+      });
+      return res.redirect(accountLink.url);
+    }
+  } catch (error) {
+    console.error('Error in onboarding-refresh:', error);
+  }
+
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>MOTO SPA S.S - Registro Stripe</title>
+        <style>
+          body { font-family: system-ui, -apple-system, sans-serif; background: #0f172a; color: #f8fafc; text-align: center; padding: 40px 20px; }
+          .card { background: #1e293b; max-width: 420px; margin: 0 auto; padding: 30px; border-radius: 16px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }
+          h2 { color: #a855f7; margin-bottom: 10px; }
+          p { color: #94a3b8; font-size: 15px; line-height: 1.5; }
+        </style>
+      </head>
+      <body>
+        <div class="card">
+          <h2>MOTO SPA S.S</h2>
+          <p>La sesión de configuración se ha actualizado. Regresa a la aplicación para reintentar la configuración bancaria de Stripe.</p>
+        </div>
+      </body>
+    </html>
+  `);
+});
+
+// Route handler for Onboarding Complete
+app.get('/onboarding-complete', (req, res) => {
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>MOTO SPA S.S - Onboarding Completado</title>
+        <style>
+          body { font-family: system-ui, -apple-system, sans-serif; background: #0f172a; color: #f8fafc; text-align: center; padding: 40px 20px; }
+          .card { background: #1e293b; max-width: 420px; margin: 0 auto; padding: 30px; border-radius: 16px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }
+          .icon { font-size: 48px; margin-bottom: 10px; }
+          h2 { color: #22c55e; margin-bottom: 10px; }
+          p { color: #94a3b8; font-size: 15px; line-height: 1.5; }
+        </style>
+      </head>
+      <body>
+        <div class="card">
+          <div class="icon">✅</div>
+          <h2>¡Registro de Stripe Completado!</h2>
+          <p>Tu cuenta bancaria ha sido vinculada correctamente. Ya puedes regresar a la aplicación <strong>MOTO SPA S.S</strong>.</p>
+        </div>
+      </body>
+    </html>
+  `);
+});
+
+// Route handler for Subscription Success
+app.get('/success', (req, res) => {
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>MOTO SPA S.S - Suscripción Exitosa</title>
+        <style>
+          body { font-family: system-ui, -apple-system, sans-serif; background: #0f172a; color: #f8fafc; text-align: center; padding: 40px 20px; }
+          .card { background: #1e293b; max-width: 420px; margin: 0 auto; padding: 30px; border-radius: 16px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }
+          .icon { font-size: 48px; margin-bottom: 10px; }
+          h2 { color: #3b82f6; margin-bottom: 10px; }
+          p { color: #94a3b8; font-size: 15px; line-height: 1.5; }
+        </style>
+      </head>
+      <body>
+        <div class="card">
+          <div class="icon">🎉</div>
+          <h2>¡Suscripción Activada!</h2>
+          <p>Tu terminal POS ha sido activada con éxito. Puedes regresar a la aplicación <strong>MOTO SPA S.S</strong>.</p>
+        </div>
+      </body>
+    </html>
+  `);
 });
 
 // ==========================================
