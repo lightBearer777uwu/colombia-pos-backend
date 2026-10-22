@@ -44,9 +44,16 @@ app.use(express.json());
 // Step 1: Create a new connected account using Stripe Accounts API
 app.post('/create-connected-account', async (req, res) => {
   try {
-    const account = await stripe.accounts.create({
+    const { email } = req.body;
+    const accountParams = {
       type: 'standard',
-    });
+    };
+
+    if (email && typeof email === 'string' && email.trim() !== '') {
+      accountParams.email = email.trim();
+    }
+
+    const account = await stripe.accounts.create(accountParams);
 
     res.json({ accountId: account.id });
   } catch (error) {
