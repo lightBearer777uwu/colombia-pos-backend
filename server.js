@@ -49,7 +49,7 @@ app.post('/create-connected-account', async (req, res) => {
       type: 'standard',
     };
 
-    if (email && typeof email === 'string' && email.trim() !== '' && !email.includes('vendor@moto-spa.com')) {
+    if (email && typeof email === 'string' && email.trim() !== '') {
       accountParams.email = email.trim();
     }
 
