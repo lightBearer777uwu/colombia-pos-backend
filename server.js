@@ -81,13 +81,22 @@ app.post('/create-account-link', async (req, res) => {
 // Route handler for Onboarding Refresh (when switching languages or refreshing Stripe page)
 app.get('/onboarding-refresh', async (req, res) => {
   try {
-    const targetAccount = req.query.accountId || 'acct_1UKnEG4DZRScEfeV';
+    let accountId = req.query.accountId;
+    if (!accountId) {
+      const newAccount = await stripe.accounts.create({
+        type: 'standard',
+        email: 'vendor@moto-spa.com',
+      });
+      accountId = newAccount.id;
+    }
+
     const accountLink = await stripe.accountLinks.create({
-      account: targetAccount,
-      refresh_url: `https://colombia-pos-backend.onrender.com/onboarding-refresh?accountId=${targetAccount}`,
+      account: accountId,
+      refresh_url: `https://colombia-pos-backend.onrender.com/onboarding-refresh?accountId=${accountId}`,
       return_url: 'https://colombia-pos-backend.onrender.com/onboarding-complete',
       type: 'account_onboarding',
     });
+
     return res.redirect(accountLink.url);
   } catch (error) {
     console.error('Error in onboarding-refresh:', error);
