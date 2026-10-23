@@ -477,6 +477,31 @@ app.get('/api/business/me', requireFirebaseAuth, requireBusinessMember, (req, re
   });
 });
 
+app.put('/api/business/profile', requireFirebaseAuth, requireBusinessMember,
+  allowRoles('owner'), async (req, res) => {
+    const name = typeof req.body.name === 'string'
+      ? req.body.name.trim()
+      : '';
+    if (name.length < 2 || name.length > 100) {
+      return res.status(400).json({
+        error: 'Business name must be between 2 and 100 characters.',
+      });
+    }
+
+    try {
+      await getFirestore().collection('businesses').doc(req.businessId).set({
+        name,
+        updatedAt: FieldValue.serverTimestamp(),
+      }, { merge: true });
+      res.json({ name });
+    } catch (error) {
+      console.error('Business profile update failed:', error);
+      res.status(error.status || 500).json({
+        error: 'Unable to save the business name.',
+      });
+    }
+  });
+
 app.put('/api/business/payment-method', requireFirebaseAuth, requireBusinessMember,
   allowRoles('owner'), async (req, res) => {
     const { method } = req.body;
