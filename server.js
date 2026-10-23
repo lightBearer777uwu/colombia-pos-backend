@@ -835,6 +835,96 @@ app.delete(
   },
 );
 
+app.get(
+  '/api/business/providers/nequi/credentials',
+  requireFirebaseAuth,
+  requireBusinessMember,
+  allowRoles('owner'),
+  async (req, res) => {
+    try {
+      const config = await getFirestore()
+        .collection('businesses')
+        .doc(req.businessId)
+        .collection('privateIntegrations')
+        .doc('nequi');
+      const snapshot = await config.get();
+      const savedAt = snapshot.data()?.updatedAt?.toDate?.()?.toISOString() || null;
+      res.json({ configured: snapshot.exists, updatedAt: savedAt });
+    } catch (error) {
+      console.error('Nequi credential status check failed:', error);
+      res.status(error.status || 500).json({ error: 'Unable to load Nequi setup status.' });
+    }
+  },
+);
+
+app.put(
+  '/api/business/providers/nequi/credentials',
+  requireFirebaseAuth,
+  requireBusinessMember,
+  allowRoles('owner'),
+  async (req, res) => {
+    const { clientId, clientSecret, apiKey } = req.body;
+    const credentials = { clientId, clientSecret, apiKey };
+    if (
+      Object.values(credentials).some((value) =>
+        typeof value !== 'string' || value.trim().length < 4 || value.length > 500,
+      )
+    ) {
+      return res.status(400).json({
+        error: 'Enter the Client ID, Client Secret, and API Key issued by Nequi.',
+      });
+    }
+
+    try {
+      const encryptedCredentials = encryptProviderToken(
+        JSON.stringify({
+          clientId: clientId.trim(),
+          clientSecret: clientSecret.trim(),
+          apiKey: apiKey.trim(),
+        }),
+      );
+      await getFirestore()
+        .collection('businesses')
+        .doc(req.businessId)
+        .collection('privateIntegrations')
+        .doc('nequi')
+        .set({
+          credentialsEncrypted: encryptedCredentials,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      res.json({ configured: true });
+    } catch (error) {
+      console.error('Nequi credentials could not be saved:', error.message);
+      res.status(error.status || 500).json({
+        error: error.status === 503
+          ? error.message
+          : 'Unable to securely save Nequi credentials.',
+      });
+    }
+  },
+);
+
+app.delete(
+  '/api/business/providers/nequi/credentials',
+  requireFirebaseAuth,
+  requireBusinessMember,
+  allowRoles('owner'),
+  async (req, res) => {
+    try {
+      await getFirestore()
+        .collection('businesses')
+        .doc(req.businessId)
+        .collection('privateIntegrations')
+        .doc('nequi')
+        .delete();
+      res.json({ configured: false });
+    } catch (error) {
+      console.error('Nequi credentials could not be removed:', error);
+      res.status(error.status || 500).json({ error: 'Unable to remove Nequi credentials.' });
+    }
+  },
+);
+
 app.post('/api/business/bank-transfer/create', requireFirebaseAuth, requireBusinessMember,
   allowRoles('owner', 'cashier'), requirePermission('charge'), requireActiveSubscription, async (req, res) => {
     const { service, vehicle, amount } = req.body;
@@ -1234,30 +1324,22 @@ app.post('/api/local/nequi/qr', requireFirebaseAuth, requireBusinessMember, asyn
 });
 
 app.post('/api/local/nequi/charge', requireFirebaseAuth, requireBusinessMember, allowRoles('owner', 'cashier'), async (req, res) => {
-  try {
-    const { phoneNumber, value, reference } = req.body;
-    if (!phoneNumber || !value) {
-      return res.status(400).json({ success: false, error: 'Phone number and value are required' });
-    }
-
-    const clientId = process.env.NEQUI_CLIENT_ID;
-    const clientSecret = process.env.NEQUI_CLIENT_SECRET;
-    const apiKey = process.env.NEQUI_API_KEY;
-
-    if (!clientId || !clientSecret || !apiKey) {
-      return res.status(503).json({
-        success: false,
-        error: 'Nequi merchant credentials and official payment status callbacks are not configured.',
-      });
-    }
-
-    return res.status(503).json({
+  const { phoneNumber, value } = req.body;
+  if (
+    typeof phoneNumber !== 'string' ||
+    !/^(?:\+?57)?3\d{9}$/.test(phoneNumber.replace(/\s|-/g, '')) ||
+    !Number.isSafeInteger(value) ||
+    value <= 0
+  ) {
+    return res.status(400).json({
       success: false,
-      error: 'Nequi payment initiation and webhook verification must be enabled for this merchant.',
+      error: 'Enter a valid Colombian mobile number and positive whole-COP amount.',
     });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
   }
+  res.status(503).json({
+    success: false,
+    error: 'Nequi credentials can be saved securely, but this backend does not yet initiate Push payments or verify Nequi callbacks. No payment request was sent.',
+  });
 });
 
 // ==========================================
