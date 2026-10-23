@@ -696,7 +696,18 @@ app.get('/api/business/providers', requireFirebaseAuth, requireBusinessMember, a
 
 app.put('/api/business/bank-transfer', requireFirebaseAuth, requireBusinessMember, allowRoles('owner'), async (req, res) => {
   const { bank, keyType, alias, accountHolder } = req.body;
-  const banks = ['Bancolombia', 'Davivienda', 'Nequi', 'Banco de Bogotá', 'Banco Agrario', 'BBVA', 'Otro'];
+  const banks = [
+    'Bancolombia',
+    'Davivienda',
+    'Nequi',
+    'DaviPlata',
+    'Banco de Bogotá',
+    'Banco Agrario',
+    'BBVA',
+    'Banco de Occidente',
+    'Banco Caja Social',
+    'Otro',
+  ];
   const keyTypes = ['phone', 'email', 'national_id', 'merchant_code'];
   if (!banks.includes(bank) || !keyTypes.includes(keyType) ||
       typeof alias !== 'string' || alias.trim().length < 3 || alias.trim().length > 120 ||
