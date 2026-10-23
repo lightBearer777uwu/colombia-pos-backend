@@ -1,6 +1,8 @@
 const express = require('express');
 const app = express();
-const admin = require('firebase-admin');
+const { cert, initializeApp } = require('firebase-admin/app');
+const { getAuth } = require('firebase-admin/auth');
+const { FieldValue, getFirestore: getAdminFirestore } = require('firebase-admin/firestore');
 const crypto = require('crypto');
 
 const stripe = process.env.STRIPE_SECRET_KEY
@@ -11,8 +13,8 @@ let firebaseApp;
 try {
   const serviceAccount = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
   if (serviceAccount) {
-    firebaseApp = admin.initializeApp({
-      credential: admin.credential.cert(JSON.parse(serviceAccount)),
+    firebaseApp = initializeApp({
+      credential: cert(JSON.parse(serviceAccount)),
     });
   }
 } catch (error) {
@@ -25,7 +27,7 @@ function getFirestore() {
     error.status = 503;
     throw error;
   }
-  return admin.firestore();
+  return getAdminFirestore(firebaseApp);
 }
 
 function requireStripe() {
@@ -45,7 +47,7 @@ async function requireFirebaseAuth(req, res, next) {
   }
 
   try {
-    req.authUser = await admin.auth().verifyIdToken(match[1], true);
+    req.authUser = await getAuth(firebaseApp).verifyIdToken(match[1], true);
     next();
   } catch (error) {
     console.error('Firebase token verification failed:', error.message);
@@ -204,7 +206,7 @@ async function getMercadoPagoAccessToken(businessId, provider) {
           ? encryptProviderToken(data.refresh_token)
           : provider.refreshTokenEncrypted,
         expiresAt: Date.now() + (Number(data.expires_in) || 0) * 1000,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
       },
     },
   }, { merge: true });
@@ -241,7 +243,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
               checkoutSessionId: event.data.object.id,
               customerId: event.data.object.customer,
               subscriptionId: event.data.object.subscription,
-              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              updatedAt: FieldValue.serverTimestamp(),
             },
           }, { merge: true });
       }
@@ -257,7 +259,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
               status: 'active',
               subscriptionId: subscription.id,
               customerId: subscription.customer,
-              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              updatedAt: FieldValue.serverTimestamp(),
             },
           }, { merge: true });
         }
@@ -273,7 +275,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
             subscription: {
               status: event.data.object.status,
               subscriptionId: event.data.object.id,
-              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              updatedAt: FieldValue.serverTimestamp(),
             },
           }, { merge: true });
       }
@@ -292,7 +294,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
               status,
               chargesEnabled: account.charges_enabled,
               payoutsEnabled: account.payouts_enabled,
-              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              updatedAt: FieldValue.serverTimestamp(),
             },
           },
         }, { merge: true });
@@ -313,8 +315,8 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
             provider: 'stripe',
             providerPaymentId: intent.id,
             status: 'paid',
-            createdAt: admin.firestore.FieldValue.serverTimestamp(),
-            confirmedAt: admin.firestore.FieldValue.serverTimestamp(),
+            createdAt: FieldValue.serverTimestamp(),
+            confirmedAt: FieldValue.serverTimestamp(),
           }, { merge: true });
       }
       break;
@@ -384,9 +386,9 @@ app.post('/webhook/mercado-pago', async (req, res) => {
       status: payment.status === 'approved' ? 'paid' : payment.status || 'pending',
       providerPaymentId: String(payment.id),
       confirmedAt: payment.status === 'approved'
-        ? admin.firestore.FieldValue.serverTimestamp()
+        ? FieldValue.serverTimestamp()
         : null,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
     }, { merge: true });
     res.json({ received: true });
   } catch (error) {
@@ -438,8 +440,8 @@ app.post('/api/business/bootstrap', requireFirebaseAuth, async (req, res) => {
       transaction.create(businessRef, {
         ownerUid: uid,
         name: (req.authUser.name || req.authUser.email || 'Mi negocio').trim(),
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        createdAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
       });
       transaction.create(memberRef, {
         uid,
@@ -500,7 +502,7 @@ app.put('/api/business/payment-method', requireFirebaseAuth, requireBusinessMemb
     try {
       await getFirestore().collection('businesses').doc(req.businessId).set({
         defaultPaymentMethod: method,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
       }, { merge: true });
       res.json({ defaultPaymentMethod: method });
     } catch (error) {
@@ -546,7 +548,7 @@ app.post('/api/business/members', requireFirebaseAuth, requireBusinessMember,
     }
 
     try {
-      const user = await admin.auth().getUserByEmail(email);
+      const user = await getAuth(firebaseApp).getUserByEmail(email);
       if (user.uid === req.authUser.uid) {
         return res.status(400).json({ error: 'The business owner cannot change their own role.' });
       }
@@ -567,9 +569,9 @@ app.post('/api/business/members', requireFirebaseAuth, requireBusinessMember,
         role,
         active: true,
         permissions: Object.fromEntries(permissionNames.map((name) => [name, permissions[name] === true])),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
       }, { merge: true });
-      await admin.auth().setCustomUserClaims(user.uid, {
+      await getAuth(firebaseApp).setCustomUserClaims(user.uid, {
         ...(user.customClaims || {}),
         businessId: req.businessId,
       });
@@ -593,13 +595,13 @@ app.delete('/api/business/members/:uid', requireFirebaseAuth, requireBusinessMem
         .collection('members').doc(req.params.uid);
       await member.update({
         active: false,
-        revokedAt: admin.firestore.FieldValue.serverTimestamp(),
+        revokedAt: FieldValue.serverTimestamp(),
       });
-      const user = await admin.auth().getUser(req.params.uid);
+      const user = await getAuth(firebaseApp).getUser(req.params.uid);
       const claims = { ...(user.customClaims || {}) };
       if (claims.businessId === req.businessId) {
         delete claims.businessId;
-        await admin.auth().setCustomUserClaims(req.params.uid, claims);
+        await getAuth(firebaseApp).setCustomUserClaims(req.params.uid, claims);
       }
       res.json({ revoked: true });
     } catch (error) {
@@ -650,8 +652,8 @@ app.post('/api/business/transactions/cash', requireFirebaseAuth, requireBusiness
         provider: 'cash',
         status: 'paid',
         confirmedBy: req.authUser.uid,
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        confirmedAt: admin.firestore.FieldValue.serverTimestamp(),
+        createdAt: FieldValue.serverTimestamp(),
+        confirmedAt: FieldValue.serverTimestamp(),
       });
       res.status(201).json({ id: ref.id, status: 'paid' });
     } catch (error) {
@@ -675,7 +677,7 @@ app.get('/api/business/providers', requireFirebaseAuth, requireBusinessMember, a
             status: stripeStatus,
             chargesEnabled: account.charges_enabled,
             payoutsEnabled: account.payouts_enabled,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            updatedAt: FieldValue.serverTimestamp(),
           },
         },
       }, { merge: true });
@@ -727,19 +729,19 @@ app.put('/api/business/bank-transfer', requireFirebaseAuth, requireBusinessMembe
           alias: alias.trim(),
           accountHolder: accountHolder.trim(),
           status: 'manual_transfer',
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: FieldValue.serverTimestamp(),
           ...(clearPreviousMerchantQr
             ? {
-                qrImageBase64: admin.firestore.FieldValue.delete(),
-                qrImageMimeType: admin.firestore.FieldValue.delete(),
-                qrBank: admin.firestore.FieldValue.delete(),
-                qrImageUpdatedAt: admin.firestore.FieldValue.delete(),
+                qrImageBase64: FieldValue.delete(),
+                qrImageMimeType: FieldValue.delete(),
+                qrBank: FieldValue.delete(),
+                qrImageUpdatedAt: FieldValue.delete(),
               }
             : {}),
         },
       },
       defaultPaymentMethod: 'bank_transfer',
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
     }, { merge: true });
     res.json({ status: 'manual_transfer', bank, keyType, alias: alias.trim() });
   } catch (error) {
@@ -799,8 +801,8 @@ app.put(
           'providers.bankTransfer.qrImageMimeType': mimeType,
           'providers.bankTransfer.qrBank': bankTransfer.bank,
           'providers.bankTransfer.qrImageUpdatedAt':
-            admin.firestore.FieldValue.serverTimestamp(),
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            FieldValue.serverTimestamp(),
+          updatedAt: FieldValue.serverTimestamp(),
         });
       res.json({ status: 'saved', bank: bankTransfer.bank });
     } catch (error) {
@@ -821,11 +823,11 @@ app.delete(
         .collection('businesses')
         .doc(req.businessId)
         .update({
-          'providers.bankTransfer.qrImageBase64': admin.firestore.FieldValue.delete(),
-          'providers.bankTransfer.qrImageMimeType': admin.firestore.FieldValue.delete(),
-          'providers.bankTransfer.qrBank': admin.firestore.FieldValue.delete(),
-          'providers.bankTransfer.qrImageUpdatedAt': admin.firestore.FieldValue.delete(),
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          'providers.bankTransfer.qrImageBase64': FieldValue.delete(),
+          'providers.bankTransfer.qrImageMimeType': FieldValue.delete(),
+          'providers.bankTransfer.qrBank': FieldValue.delete(),
+          'providers.bankTransfer.qrImageUpdatedAt': FieldValue.delete(),
+          updatedAt: FieldValue.serverTimestamp(),
         });
       res.json({ status: 'removed' });
     } catch (error) {
@@ -890,7 +892,7 @@ app.put(
         .doc('nequi')
         .set({
           credentialsEncrypted: encryptedCredentials,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: FieldValue.serverTimestamp(),
         });
       res.json({ configured: true });
     } catch (error) {
@@ -950,7 +952,7 @@ app.post('/api/business/bank-transfer/create', requireFirebaseAuth, requireBusin
         status: 'pending',
         transferAlias: bankTransfer.alias,
         transferKeyType: bankTransfer.keyType,
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        createdAt: FieldValue.serverTimestamp(),
       });
       res.status(201).json({
         transactionId: ref.id,
@@ -992,7 +994,7 @@ app.post('/api/business/mercado-pago/create-payment', requireFirebaseAuth, requi
         method: 'Mercado Pago',
         provider: 'mercado_pago',
         status: 'pending',
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        createdAt: FieldValue.serverTimestamp(),
       });
 
       const response = await fetch('https://api.mercadopago.com/checkout/preferences', {
@@ -1022,7 +1024,7 @@ app.post('/api/business/mercado-pago/create-payment', requireFirebaseAuth, requi
       if (!response.ok || !preference.init_point) {
         await transactionRef.update({
           status: 'failed',
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: FieldValue.serverTimestamp(),
         });
         console.error('Mercado Pago preference creation failed:', preference.message || response.status);
         return res.status(502).json({ error: 'Mercado Pago could not create checkout for this seller.' });
@@ -1036,7 +1038,7 @@ app.post('/api/business/mercado-pago/create-payment', requireFirebaseAuth, requi
       if (transactionRef) {
         await transactionRef.set({
           status: 'failed',
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: FieldValue.serverTimestamp(),
         }, { merge: true });
       }
       console.error('Mercado Pago checkout failed:', error);
@@ -1069,7 +1071,7 @@ app.post('/api/business/transactions/:transactionId/confirm-transfer',
           status: 'paid',
           confirmationSource: 'vendor_bank_verification',
           confirmedBy: req.authUser.uid,
-          confirmedAt: admin.firestore.FieldValue.serverTimestamp(),
+          confirmedAt: FieldValue.serverTimestamp(),
         });
         return { id: doc.id, status: 'paid' };
       });
@@ -1142,7 +1144,7 @@ app.get('/oauth/mercado-pago/callback', async (req, res) => {
             : null,
           expiresAt: Date.now() + (Number(tokenData.expires_in) || 0) * 1000,
           status: 'connected',
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: FieldValue.serverTimestamp(),
         },
       },
     }, { merge: true });
@@ -1185,7 +1187,7 @@ app.post('/create-connected-account', requireFirebaseAuth, requireBusinessMember
         stripe: {
           accountId: account.id,
           status: 'onboarding',
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: FieldValue.serverTimestamp(),
         },
       },
     }, { merge: true });
