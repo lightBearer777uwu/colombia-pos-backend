@@ -708,6 +708,14 @@ app.put('/api/business/bank-transfer', requireFirebaseAuth, requireBusinessMembe
     'BBVA',
     'Banco de Occidente',
     'Banco Caja Social',
+    'Banco Popular',
+    'Banco AV Villas',
+    'Scotiabank Colpatria',
+    'Banco Falabella',
+    'Nu',
+    'Lulo Bank',
+    'Banco Pichincha',
+    'Bancoomeva',
     'Otro',
   ];
   const keyTypes = ['phone', 'email', 'national_id', 'merchant_code'];
