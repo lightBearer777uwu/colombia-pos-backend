@@ -716,6 +716,9 @@ app.put('/api/business/bank-transfer', requireFirebaseAuth, requireBusinessMembe
   }
 
   try {
+    const previousBank = req.business.providers?.bankTransfer?.bank;
+    const clearPreviousMerchantQr =
+      previousBank && previousBank !== bank;
     await getFirestore().collection('businesses').doc(req.businessId).set({
       providers: {
         bankTransfer: {
@@ -725,6 +728,14 @@ app.put('/api/business/bank-transfer', requireFirebaseAuth, requireBusinessMembe
           accountHolder: accountHolder.trim(),
           status: 'manual_transfer',
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          ...(clearPreviousMerchantQr
+            ? {
+                qrImageBase64: admin.firestore.FieldValue.delete(),
+                qrImageMimeType: admin.firestore.FieldValue.delete(),
+                qrBank: admin.firestore.FieldValue.delete(),
+                qrImageUpdatedAt: admin.firestore.FieldValue.delete(),
+              }
+            : {}),
         },
       },
       defaultPaymentMethod: 'bank_transfer',
@@ -736,6 +747,93 @@ app.put('/api/business/bank-transfer', requireFirebaseAuth, requireBusinessMembe
     res.status(error.status || 500).json({ error: error.message });
   }
 });
+
+const MAX_MERCHANT_QR_BYTES = 600 * 1024;
+const merchantQrImageBody = express.raw({
+  type: ['image/png', 'image/jpeg'],
+  limit: MAX_MERCHANT_QR_BYTES,
+});
+
+app.put(
+  '/api/business/bank-transfer/qr',
+  requireFirebaseAuth,
+  requireBusinessMember,
+  allowRoles('owner'),
+  merchantQrImageBody,
+  async (req, res) => {
+    const bankTransfer = req.business.providers?.bankTransfer;
+    if (!['Bancolombia', 'Nequi'].includes(bankTransfer?.bank)) {
+      return res.status(409).json({
+        error: 'Provider QR image upload is available for Bancolombia or Nequi Negocios.',
+      });
+    }
+
+    if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+      return res.status(400).json({ error: 'Select a PNG or JPEG merchant QR image.' });
+    }
+    if (req.body.length > MAX_MERCHANT_QR_BYTES) {
+      return res.status(413).json({ error: 'The QR image must be 600 KB or smaller.' });
+    }
+
+    const mimeType = req.headers['content-type']?.split(';')[0]?.trim();
+    const isPng = req.body.subarray(0, 8).equals(
+      Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    );
+    const isJpeg =
+      req.body[0] === 0xff &&
+      req.body[1] === 0xd8 &&
+      req.body[2] === 0xff;
+    if (
+      !((mimeType === 'image/png' && isPng) ||
+        (mimeType === 'image/jpeg' && isJpeg))
+    ) {
+      return res.status(400).json({ error: 'The file must be a valid PNG or JPEG image.' });
+    }
+
+    try {
+      await getFirestore()
+        .collection('businesses')
+        .doc(req.businessId)
+        .update({
+          'providers.bankTransfer.qrImageBase64': req.body.toString('base64'),
+          'providers.bankTransfer.qrImageMimeType': mimeType,
+          'providers.bankTransfer.qrBank': bankTransfer.bank,
+          'providers.bankTransfer.qrImageUpdatedAt':
+            admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      res.json({ status: 'saved', bank: bankTransfer.bank });
+    } catch (error) {
+      console.error('Merchant QR image upload failed:', error);
+      res.status(error.status || 500).json({ error: 'Unable to save the merchant QR image.' });
+    }
+  },
+);
+
+app.delete(
+  '/api/business/bank-transfer/qr',
+  requireFirebaseAuth,
+  requireBusinessMember,
+  allowRoles('owner'),
+  async (req, res) => {
+    try {
+      await getFirestore()
+        .collection('businesses')
+        .doc(req.businessId)
+        .update({
+          'providers.bankTransfer.qrImageBase64': admin.firestore.FieldValue.delete(),
+          'providers.bankTransfer.qrImageMimeType': admin.firestore.FieldValue.delete(),
+          'providers.bankTransfer.qrBank': admin.firestore.FieldValue.delete(),
+          'providers.bankTransfer.qrImageUpdatedAt': admin.firestore.FieldValue.delete(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      res.json({ status: 'removed' });
+    } catch (error) {
+      console.error('Merchant QR image removal failed:', error);
+      res.status(error.status || 500).json({ error: 'Unable to remove the merchant QR image.' });
+    }
+  },
+);
 
 app.post('/api/business/bank-transfer/create', requireFirebaseAuth, requireBusinessMember,
   allowRoles('owner', 'cashier'), requirePermission('charge'), requireActiveSubscription, async (req, res) => {
@@ -1291,6 +1389,17 @@ app.post('/create-checkout-session', requireFirebaseAuth, requireBusinessMember,
     console.error('Subscription checkout creation failed:', error);
     res.status(error.status || 500).json({ error: error.message });
   }
+});
+
+app.use((error, req, res, next) => {
+  if (error.type === 'entity.too.large') {
+    return res.status(413).json({ error: 'The uploaded image exceeds the 600 KB limit.' });
+  }
+  if (error.type === 'entity.parse.failed') {
+    return res.status(400).json({ error: 'The request body is invalid.' });
+  }
+  console.error('Unhandled request error:', error);
+  res.status(500).json({ error: 'The server could not process this request.' });
 });
 
 const PORT = process.env.PORT || 3000;
