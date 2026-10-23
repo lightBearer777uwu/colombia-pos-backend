@@ -763,6 +763,7 @@ app.post('/webhook/mercado-pago', async (req, res) => {
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
+    revision: process.env.RENDER_GIT_COMMIT || null,
     firebaseConfigured: Boolean(firebaseApp),
     stripeConfigured: Boolean(stripe),
   });
