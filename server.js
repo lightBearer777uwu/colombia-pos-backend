@@ -470,9 +470,44 @@ app.get('/api/business/me', requireFirebaseAuth, requireBusinessMember, (req, re
     role: req.memberRole,
     permissions: req.memberPermissions,
     providers: req.business.providers || {},
+    defaultPaymentMethod: req.business.defaultPaymentMethod || '',
     subscription: req.business.subscription || { status: 'inactive' },
   });
 });
+
+app.put('/api/business/payment-method', requireFirebaseAuth, requireBusinessMember,
+  allowRoles('owner'), async (req, res) => {
+    const { method } = req.body;
+    const allowedMethods = ['bank_transfer', 'mercado_pago', 'stripe'];
+    if (!allowedMethods.includes(method)) {
+      return res.status(400).json({ error: 'Choose a supported payment method.' });
+    }
+
+    const providers = req.business.providers || {};
+    const configured = {
+      bank_transfer: Boolean(providers.bankTransfer?.alias),
+      mercado_pago: providers.mercadoPago?.status === 'connected' &&
+        Boolean(providers.mercadoPago?.accessTokenEncrypted),
+      stripe: Boolean(providers.stripe?.accountId) &&
+        providers.stripe?.status === 'active',
+    };
+    if (!configured[method]) {
+      return res.status(409).json({
+        error: 'Connect and verify this payment method before making it the default.',
+      });
+    }
+
+    try {
+      await getFirestore().collection('businesses').doc(req.businessId).set({
+        defaultPaymentMethod: method,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+      res.json({ defaultPaymentMethod: method });
+    } catch (error) {
+      console.error('Default payment method update failed:', error);
+      res.status(error.status || 500).json({ error: 'Unable to save the default payment method.' });
+    }
+  });
 
 app.get('/api/business/members', requireFirebaseAuth, requireBusinessMember,
   allowRoles('owner'), async (req, res) => {
@@ -681,6 +716,8 @@ app.put('/api/business/bank-transfer', requireFirebaseAuth, requireBusinessMembe
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         },
       },
+      defaultPaymentMethod: 'bank_transfer',
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     }, { merge: true });
     res.json({ status: 'manual_transfer', bank, keyType, alias: alias.trim() });
   } catch (error) {
