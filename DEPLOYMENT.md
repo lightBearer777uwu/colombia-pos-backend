@@ -2,7 +2,7 @@
 
 ## Firebase
 
-1. Enable Firebase Authentication email/password and whichever Google/Apple providers the app will use. Configure each provider's native OAuth credentials and bundle/package identifiers in Firebase.
+1. Enable Firebase Authentication **Anonymous** sign-in for this no-sign-up test build. For a production release, use a recoverable business-owner sign-in and account-linking flow; anonymous test businesses are tied to one app installation and cannot be recovered after app data is cleared or the device is replaced. Configure email/password, Google, or Apple only if those login methods are intentionally reintroduced.
 2. Create the Firestore database in the same Firebase project and deploy the app's `firestore.rules`. Keep transaction, membership, and inventory writes server-only; the Render service uses Firebase Admin.
 3. Add the Firebase Admin service-account JSON to Render as `FIREBASE_SERVICE_ACCOUNT_JSON`. Never put this credential in the Flutter app or commit it.
 4. Build Flutter with the Firebase-generated platform configuration and the Render API URL:
