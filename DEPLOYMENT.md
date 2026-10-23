@@ -11,6 +11,32 @@
    flutter run --dart-define=BACKEND_BASE_URL=https://YOUR-RENDER-DOMAIN
    ```
 
+5. Enable **Email/Password** in Firebase Authentication. The app continues to
+   open directly into the POS with an anonymous device session, and the owner
+   can link that session to a verified work email from **Cuenta y empresa**;
+   linking preserves that installation's existing business identity. Staff
+   invitations require the owner's email and each employee's email to be
+   verified. Configure Firebase's email verification and password-reset
+   templates and authorized domains before rollout. Each user should have an
+   individual account; do not share a cashier or administrator password.
+6. A verified owner creates a seven-day employee invitation in Finance and
+   shares its one-time code through a trusted channel. The invited person signs
+   in or secures their account, verifies the invited email, and accepts the code
+   in **Cuenta y empresa**. Acceptance uses explicit role permissions. If the
+   invitee has an empty temporary bootstrap workspace, the backend deactivates
+   that workspace and attaches the user to the invited business. It refuses to
+   merge an account that already has sales, an active subscription, or payment
+   provider setup; use a separate work account in that case. Codes are hashed
+   at rest, expire after seven days, and can only be accepted by the invited
+   verified email.
+
+The **Cuenta y empresa** screen records the business category and operating
+model (independent store, chain supplier, in-store chain operation, inventory
+partner, or contractor), plus an indicative number of locations. This is
+onboarding context only; it does not create chain access or change Stripe
+subscription pricing/entitlements. The inventory and chain-readiness data
+remain device-local until server synchronization is implemented.
+
 ## Render environment
 
 Configure the following values in the backend Render service. Use secrets for credentials and keep `DOMAIN` set to the public HTTPS origin without a trailing slash.
@@ -54,4 +80,7 @@ Nequi Push is a separate assisted payment flow, not the static merchant QR. Nequ
 
 If the public `/health` endpoint reports `firebaseConfigured: false`, this is a platform-owner deployment issue, not a vendor payment credential. The Firebase project administrator must add that project's Firebase Admin service-account JSON as Render's `FIREBASE_SERVICE_ACCOUNT_JSON` secret and redeploy/restart the service. Never ask a vendor to provide this platform service account or place it in the app. The owner must separately configure `PROVIDER_TOKEN_ENCRYPTION_KEY` (base64 of 32 random bytes) in Render before the app can save merchant API credentials.
 
-Employees must first create a Firebase Auth account before an owner can add their email and permissions. The app does not currently send employee invitations.
+The legacy owner-only `POST /api/business/members` endpoint remains available
+for verified existing accounts. New staff setup should use the invitation-code
+flow so the employee can join from the app without an administrator manually
+adding an already-registered UID.

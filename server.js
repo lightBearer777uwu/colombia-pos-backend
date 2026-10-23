@@ -844,6 +844,7 @@ app.get('/api/business/me', requireFirebaseAuth, requireBusinessMember, async (r
           environment: wompiIntegration.data()?.environment || null,
         },
       },
+      businessProfile: req.business.businessProfile || {},
       defaultPaymentMethod: req.business.defaultPaymentMethod || '',
       subscription: req.business.subscription || { status: 'inactive' },
     });
@@ -874,6 +875,54 @@ app.put('/api/business/profile', requireFirebaseAuth, requireBusinessMember,
       console.error('Business profile update failed:', error);
       res.status(error.status || 500).json({
         error: 'Unable to save the business name.',
+      });
+    }
+  });
+
+app.put('/api/business/profile/settings', requireFirebaseAuth, requireBusinessMember,
+  allowRoles('owner'), async (req, res) => {
+  const { name, businessType, operatingModel, locationCount } = req.body;
+    const businessTypes = [
+      'retail',
+      'pharmacy',
+      'restaurant',
+      'supplier',
+      'contractor',
+      'chain',
+      'other',
+    ];
+    const operatingModels = [
+      'independent',
+      'supplier_to_chain',
+      'chain_store',
+      'inventory_partner',
+      'contractor',
+    ];
+    const businessName = typeof name === 'string' ? name.trim() : '';
+    if (businessName.length < 2 ||
+        businessName.length > 100 ||
+        !businessTypes.includes(businessType) ||
+        !operatingModels.includes(operatingModel) ||
+        !Number.isInteger(locationCount) ||
+        locationCount < 1 ||
+        locationCount > 10000) {
+      return res.status(400).json({
+        error: 'Choose a supported business type, operating model, and location count.',
+      });
+    }
+
+    try {
+      const businessProfile = { businessType, operatingModel, locationCount };
+      await getFirestore().collection('businesses').doc(req.businessId).set({
+        name: businessName,
+        businessProfile,
+        updatedAt: FieldValue.serverTimestamp(),
+      }, { merge: true });
+      res.json({ name: businessName, businessProfile });
+    } catch (error) {
+      console.error('Business operating profile update failed:', error);
+      res.status(error.status || 500).json({
+        error: 'Unable to save the business operating profile.',
       });
     }
   });
@@ -950,8 +999,215 @@ app.get('/api/business/members', requireFirebaseAuth, requireBusinessMember,
     }
   });
 
+app.post('/api/business/invitations', requireFirebaseAuth, requireBusinessMember,
+  allowRoles('owner'), async (req, res) => {
+    if (req.authUser.email_verified !== true) {
+      return res.status(403).json({
+        error: 'Verify the owner email before inviting company users.',
+      });
+    }
+    const email = typeof req.body.email === 'string'
+      ? req.body.email.trim().toLowerCase()
+      : '';
+    const role = req.body.role;
+    const permissions = req.body.permissions;
+    const permittedRoles = ['cashier', 'inventory'];
+    const permissionNames = ['charge', 'viewInventory', 'manageInventory', 'viewReports'];
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email) ||
+        email === req.authUser.email?.toLowerCase() ||
+        !permittedRoles.includes(role) ||
+        !permissions ||
+        typeof permissions !== 'object' ||
+        Array.isArray(permissions) ||
+        Object.keys(permissions).some((key) => !permissionNames.includes(key)) ||
+        Object.values(permissions).some((value) => typeof value !== 'boolean')) {
+      return res.status(400).json({
+        error: 'Enter a different employee email, valid role, and explicit permissions.',
+      });
+    }
+
+    try {
+      const token = crypto.randomBytes(32).toString('base64url');
+      const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+      await getFirestore().collection('businessInvitations').doc(tokenHash).create({
+        businessId: req.businessId,
+        email,
+        role,
+        permissions: Object.fromEntries(
+          permissionNames.map((name) => [name, permissions[name] === true]),
+        ),
+        status: 'pending',
+        createdBy: req.authUser.uid,
+        createdAt: FieldValue.serverTimestamp(),
+        expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000,
+      });
+      res.status(201).json({
+        invitationCode: token,
+        email,
+        expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+      });
+    } catch (error) {
+      console.error('Creating business invitation failed:', error);
+      res.status(error.status || 500).json({
+        error: 'Unable to create the company invitation.',
+      });
+    }
+  });
+
+app.post('/api/business/invitations/accept', requireFirebaseAuth, async (req, res) => {
+  const invitationCode = typeof req.body.invitationCode === 'string'
+    ? req.body.invitationCode.trim()
+    : '';
+  if (!/^[A-Za-z0-9_-]{40,50}$/.test(invitationCode)) {
+    return res.status(400).json({ error: 'Enter a valid invitation code.' });
+  }
+  if (req.authUser.email_verified !== true || !req.authUser.email) {
+    return res.status(403).json({
+      error: 'Verify your work email before accepting a company invitation.',
+    });
+  }
+
+  const tokenHash = crypto.createHash('sha256').update(invitationCode).digest('hex');
+  const db = getFirestore();
+  const invitationRef = db.collection('businessInvitations').doc(tokenHash);
+  let acceptedBusinessId;
+  try {
+    await db.runTransaction(async (transaction) => {
+      const invitationSnapshot = await transaction.get(invitationRef);
+      if (!invitationSnapshot.exists) {
+        const error = new Error('This invitation is invalid or has expired.');
+        error.status = 404;
+        throw error;
+      }
+      const invitation = invitationSnapshot.data();
+      if (invitation.email !== req.authUser.email.toLowerCase()) {
+        const error = new Error('Sign in with the work email this invitation was sent to.');
+        error.status = 403;
+        throw error;
+      }
+      acceptedBusinessId = invitation.businessId;
+      if (invitation.status === 'accepted' &&
+          invitation.acceptedBy === req.authUser.uid) {
+        return;
+      }
+      if (invitation.status !== 'pending' || invitation.expiresAt < Date.now()) {
+        const error = new Error('This invitation is invalid or has expired.');
+        error.status = 410;
+        throw error;
+      }
+
+      const targetBusinessRef = db.collection('businesses').doc(acceptedBusinessId);
+      const targetMemberRef = targetBusinessRef.collection('members').doc(req.authUser.uid);
+      const [targetBusiness, targetMember] = await Promise.all([
+        transaction.get(targetBusinessRef),
+        transaction.get(targetMemberRef),
+      ]);
+      if (!targetBusiness.exists) {
+        const error = new Error('The inviting company is no longer available.');
+        error.status = 404;
+        throw error;
+      }
+      if (targetMember.exists && targetMember.data().active === true) {
+        transaction.update(invitationRef, {
+          status: 'accepted',
+          acceptedBy: req.authUser.uid,
+          acceptedAt: FieldValue.serverTimestamp(),
+        });
+        return;
+      }
+
+      const currentBusinessId = req.authUser.businessId || req.authUser.uid;
+      if (currentBusinessId !== req.authUser.uid) {
+        const error = new Error('This account is already connected to another company.');
+        error.status = 409;
+        throw error;
+      }
+      const currentBusinessRef = db.collection('businesses').doc(req.authUser.uid);
+      const currentMemberRef = currentBusinessRef.collection('members').doc(req.authUser.uid);
+      const ownTransactions = currentBusinessRef.collection('transactions').limit(1);
+      const ownWompiRef = currentBusinessRef.collection('privateIntegrations').doc('wompi');
+      const ownNequiRef = currentBusinessRef.collection('privateIntegrations').doc('nequi');
+      const [
+        currentBusiness,
+        currentMember,
+        transactions,
+        wompi,
+        nequi,
+      ] = await Promise.all([
+        transaction.get(currentBusinessRef),
+        transaction.get(currentMemberRef),
+        transaction.get(ownTransactions),
+        transaction.get(ownWompiRef),
+        transaction.get(ownNequiRef),
+      ]);
+      if (!currentBusiness.exists || !currentMember.exists ||
+          currentBusiness.data().ownerUid !== req.authUser.uid ||
+          currentMember.data().role !== 'owner' ||
+          currentMember.data().active !== true ||
+          transactions.size > 0 ||
+          ['active', 'trialing'].includes(currentBusiness.data().subscription?.status) ||
+          currentBusiness.data().providers?.stripe?.accountId ||
+          currentBusiness.data().providers?.mercadoPago?.userId ||
+          currentBusiness.data().providers?.bankTransfer?.alias ||
+          currentBusiness.data().providers?.bankTransfer?.qrImageBase64 ||
+          wompi.exists ||
+          nequi.exists) {
+        const error = new Error(
+          'This account already has a company, payment setup, subscription, or sales. ' +
+          'Use a separate verified work account to join another company.',
+        );
+        error.status = 409;
+        throw error;
+      }
+      const memberPermissions = invitation.permissions || {};
+      transaction.set(targetMemberRef, {
+        uid: req.authUser.uid,
+        email: req.authUser.email.toLowerCase(),
+        role: invitation.role,
+        active: true,
+        permissions: memberPermissions,
+        invitedBy: invitation.createdBy,
+        joinedAt: FieldValue.serverTimestamp(),
+      });
+      transaction.update(currentBusinessRef, {
+        ownerUid: null,
+        migratedTo: acceptedBusinessId,
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      transaction.update(currentMemberRef, {
+        active: false,
+        migratedTo: acceptedBusinessId,
+        revokedAt: FieldValue.serverTimestamp(),
+      });
+      transaction.update(invitationRef, {
+        status: 'accepted',
+        acceptedBy: req.authUser.uid,
+        acceptedAt: FieldValue.serverTimestamp(),
+      });
+    });
+
+    const user = await getAuth(firebaseApp).getUser(req.authUser.uid);
+    await getAuth(firebaseApp).setCustomUserClaims(user.uid, {
+      ...(user.customClaims || {}),
+      businessId: acceptedBusinessId,
+    });
+    res.json({ businessId: acceptedBusinessId, accepted: true });
+  } catch (error) {
+    if (error.status) {
+      return res.status(error.status).json({ error: error.message });
+    }
+    console.error('Accepting business invitation failed:', error);
+    res.status(500).json({ error: 'Unable to accept the company invitation.' });
+  }
+});
+
 app.post('/api/business/members', requireFirebaseAuth, requireBusinessMember,
   allowRoles('owner'), async (req, res) => {
+    if (req.authUser.email_verified !== true) {
+      return res.status(403).json({
+        error: 'Verify the owner email before managing company users.',
+      });
+    }
     const email = typeof req.body.email === 'string' ? req.body.email.trim().toLowerCase() : '';
     const role = req.body.role;
     const permissions = req.body.permissions;
@@ -966,6 +1222,11 @@ app.post('/api/business/members', requireFirebaseAuth, requireBusinessMember,
 
     try {
       const user = await getAuth(firebaseApp).getUserByEmail(email);
+      if (!user.emailVerified) {
+        return res.status(409).json({
+          error: 'The employee must verify their email address before being added.',
+        });
+      }
       if (user.uid === req.authUser.uid) {
         return res.status(400).json({ error: 'The business owner cannot change their own role.' });
       }
