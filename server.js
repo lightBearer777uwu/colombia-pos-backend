@@ -334,6 +334,369 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
 
 app.use(express.json());
 
+app.get('/api/business/providers/wompi/credentials',
+  requireFirebaseAuth, requireBusinessMember, allowRoles('owner'), async (req, res) => {
+    try {
+      const snapshot = await getFirestore().collection('businesses').doc(req.businessId)
+        .collection('privateIntegrations').doc('wompi').get();
+      const integration = snapshot.data();
+      res.json({
+        configured: snapshot.exists,
+        publicKey: integration?.publicKey || null,
+        environment: integration?.environment || null,
+        webhookUrl: integration?.webhookRoute
+          ? `${new URL(process.env.DOMAIN).origin}/webhook/wompi/${integration.webhookRoute}`
+          : null,
+        updatedAt: integration?.updatedAt?.toDate?.()?.toISOString() || null,
+      });
+    } catch (error) {
+      console.error('Wompi credential status check failed:', error);
+      res.status(error.status || 500).json({ error: 'Unable to load Wompi setup status.' });
+    }
+  });
+
+app.put('/api/business/providers/wompi/credentials',
+  requireFirebaseAuth, requireBusinessMember, allowRoles('owner'), async (req, res) => {
+    const { publicKey, privateKey, integritySecret, eventsSecret } = req.body;
+    const environment = typeof publicKey === 'string' && publicKey.startsWith('pub_test_')
+      ? 'test'
+      : typeof publicKey === 'string' && publicKey.startsWith('pub_prod_')
+        ? 'production'
+        : null;
+    const secretPrefix = environment === 'test' ? 'test_' : 'prod_';
+    if (!environment ||
+        publicKey.trim().length > 500 ||
+        typeof privateKey !== 'string' ||
+        !privateKey.trim().startsWith(
+          environment === 'test' ? 'prv_test_' : 'prv_prod_',
+        ) ||
+        privateKey.trim().length < 20 ||
+        privateKey.length > 500 ||
+        typeof integritySecret !== 'string' ||
+        !integritySecret.trim().startsWith(`${secretPrefix}integrity_`) ||
+        integritySecret.trim().length < 20 ||
+        integritySecret.length > 500 ||
+        typeof eventsSecret !== 'string' ||
+        !eventsSecret.trim().startsWith(`${secretPrefix}events_`) ||
+        eventsSecret.trim().length < 20 ||
+        eventsSecret.length > 500) {
+      return res.status(400).json({
+        error: 'Enter the Wompi public key, integrity secret, and event secret for the same environment.',
+      });
+    }
+    let webhookOrigin;
+    try {
+      webhookOrigin = new URL(process.env.DOMAIN);
+    } catch (_) {
+      return res.status(503).json({ error: 'Configure DOMAIN as the backend public HTTPS origin.' });
+    }
+    if (webhookOrigin.protocol !== 'https:' || webhookOrigin.pathname !== '/' ||
+        webhookOrigin.search || webhookOrigin.hash) {
+      return res.status(503).json({ error: 'Configure DOMAIN as the backend public HTTPS origin.' });
+    }
+
+    try {
+      const db = getFirestore();
+      const pendingPayments = await db.collection('businesses').doc(req.businessId)
+        .collection('transactions').where('status', '==', 'pending').get();
+      if (pendingPayments.docs.some((payment) => payment.data().provider === 'wompi')) {
+        return res.status(409).json({
+          error: 'Resolve pending Wompi payments before replacing merchant credentials.',
+        });
+      }
+      const integrationRef = db.collection('businesses').doc(req.businessId)
+        .collection('privateIntegrations').doc('wompi');
+      const credentialsEncrypted = encryptProviderToken(JSON.stringify({
+        privateKey: privateKey.trim(),
+        integritySecret: integritySecret.trim(),
+        eventsSecret: eventsSecret.trim(),
+      }));
+      const webhookRoute = await db.runTransaction(async (transaction) => {
+        const previous = await transaction.get(integrationRef);
+        const route = previous.data()?.webhookRoute || crypto.randomBytes(32).toString('hex');
+        transaction.set(integrationRef, {
+          publicKey: publicKey.trim(),
+          environment,
+          credentialsEncrypted,
+          webhookRoute: route,
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+        transaction.set(db.collection('wompiWebhookRoutes').doc(route), {
+          businessId: req.businessId,
+        });
+        return route;
+      });
+      res.json({
+        configured: true,
+        publicKey: publicKey.trim(),
+        environment,
+        webhookUrl: `${webhookOrigin.origin}/webhook/wompi/${webhookRoute}`,
+      });
+    } catch (error) {
+      console.error('Wompi credentials could not be saved:', error.message);
+      res.status(error.status || 500).json({
+        error: error.status === 503
+          ? error.message
+          : 'Unable to securely save Wompi credentials.',
+      });
+    }
+  });
+
+app.delete('/api/business/providers/wompi/credentials',
+  requireFirebaseAuth, requireBusinessMember, allowRoles('owner'), async (req, res) => {
+    try {
+      const db = getFirestore();
+      const pendingPayments = await db.collection('businesses').doc(req.businessId)
+        .collection('transactions').where('status', '==', 'pending').get();
+      if (pendingPayments.docs.some((payment) => payment.data().provider === 'wompi')) {
+        return res.status(409).json({
+          error: 'Resolve pending Wompi payments before disconnecting the merchant account.',
+        });
+      }
+      const integrationRef = db.collection('businesses').doc(req.businessId)
+        .collection('privateIntegrations').doc('wompi');
+      const snapshot = await integrationRef.get();
+      const webhookRoute = snapshot.data()?.webhookRoute;
+      await integrationRef.delete();
+      if (webhookRoute) {
+        await db.collection('wompiWebhookRoutes').doc(webhookRoute).delete();
+      }
+      if (req.business.defaultPaymentMethod === 'wompi') {
+        await db.collection('businesses').doc(req.businessId).set({
+          defaultPaymentMethod: '',
+          updatedAt: FieldValue.serverTimestamp(),
+        }, { merge: true });
+      }
+      res.json({ configured: false });
+    } catch (error) {
+      console.error('Wompi credentials could not be removed:', error);
+      res.status(error.status || 500).json({ error: 'Unable to remove Wompi credentials.' });
+    }
+  });
+
+app.post('/api/business/wompi/create-payment', requireFirebaseAuth, requireBusinessMember,
+  allowRoles('owner', 'cashier'), requirePermission('charge'), requireActiveSubscription, async (req, res) => {
+    const { service, vehicle, amount } = req.body;
+    if (typeof service !== 'string' || !service.trim() ||
+        !Number.isSafeInteger(amount) || amount <= 0 ||
+        !Number.isSafeInteger(amount * 100)) {
+      return res.status(400).json({ error: 'A service and positive whole-COP amount are required.' });
+    }
+
+    let transactionRef;
+    let reference;
+    try {
+      const db = getFirestore();
+      const integrationSnapshot = await db.collection('businesses').doc(req.businessId)
+        .collection('privateIntegrations').doc('wompi').get();
+      const integration = integrationSnapshot.data();
+      if (!integration?.publicKey || !integration.credentialsEncrypted) {
+        return res.status(409).json({ error: 'Configure Wompi merchant credentials before creating a checkout.' });
+      }
+
+      const { integritySecret } = JSON.parse(decryptProviderToken(integration.credentialsEncrypted));
+      transactionRef = db.collection('businesses').doc(req.businessId)
+        .collection('transactions').doc();
+      reference = `pos_${req.businessId}_${transactionRef.id}`;
+      const amountInCents = amount * 100;
+      const integritySignature = crypto.createHash('sha256')
+        .update(`${reference}${amountInCents}COP${integritySecret}`)
+        .digest('hex');
+      const checkoutUrl = new URL('https://checkout.wompi.co/p/');
+      checkoutUrl.searchParams.set('public-key', integration.publicKey);
+      checkoutUrl.searchParams.set('currency', 'COP');
+      checkoutUrl.searchParams.set('amount-in-cents', String(amountInCents));
+      checkoutUrl.searchParams.set('reference', reference);
+      checkoutUrl.searchParams.set('signature:integrity', integritySignature);
+
+      await db.runTransaction(async (transaction) => {
+        transaction.create(transactionRef, {
+          service: service.trim(),
+          vehicle: typeof vehicle === 'string' ? vehicle.trim() : '',
+          amount,
+          amountInCents,
+          currency: 'COP',
+          method: 'Wompi',
+          provider: 'wompi',
+          paymentEnvironment: integration.environment,
+          providerReference: reference,
+          status: 'pending',
+          createdAt: FieldValue.serverTimestamp(),
+        });
+        transaction.create(db.collection('wompiPaymentReferences').doc(reference), {
+          businessId: req.businessId,
+          transactionId: transactionRef.id,
+          createdAt: FieldValue.serverTimestamp(),
+        });
+      });
+
+      res.status(201).json({
+        transactionId: transactionRef.id,
+        status: 'pending',
+        checkoutUrl: checkoutUrl.toString(),
+      });
+    } catch (error) {
+      if (transactionRef && reference) {
+        await transactionRef.set({
+          status: 'failed',
+          updatedAt: FieldValue.serverTimestamp(),
+        }, { merge: true }).catch((updateError) => {
+          console.error('Failed to mark Wompi checkout as failed:', updateError);
+        });
+      }
+      console.error('Wompi checkout creation failed:', error);
+      res.status(error.status || 500).json({
+        error: error.status === 503
+          ? error.message
+          : 'Wompi could not create checkout for this seller.',
+      });
+    }
+  });
+
+app.post('/webhook/wompi/:routeToken', async (req, res) => {
+  try {
+    if (!/^[a-f0-9]{64}$/.test(req.params.routeToken)) {
+      return res.status(404).json({ error: 'Wompi webhook route was not found.' });
+    }
+    const db = getFirestore();
+    const routeSnapshot = await db.collection('wompiWebhookRoutes')
+      .doc(req.params.routeToken).get();
+    if (!routeSnapshot.exists) {
+      return res.status(404).json({ error: 'Wompi webhook route was not found.' });
+    }
+
+    const businessId = routeSnapshot.data().businessId;
+    const integrationSnapshot = await db.collection('businesses').doc(businessId)
+      .collection('privateIntegrations').doc('wompi').get();
+    const integration = integrationSnapshot.data();
+    if (!integration?.credentialsEncrypted) {
+      return res.status(404).json({ error: 'Wompi merchant configuration was not found.' });
+    }
+
+    const { privateKey, eventsSecret } = JSON.parse(
+      decryptProviderToken(integration.credentialsEncrypted),
+    );
+    const signature = req.body?.signature;
+    const data = req.body?.data;
+    if (    !Array.isArray(signature?.properties) || signature.properties.length === 0 ||
+    signature.properties.length > 20 ||
+    !Number.isSafeInteger(signature.timestamp) ||
+        typeof signature.checksum !== 'string' ||
+        !data || typeof data !== 'object') {
+      return res.status(400).json({ error: 'Invalid Wompi event signature data.' });
+    }
+
+    const values = [];
+    for (const property of signature.properties) {
+      if (typeof property !== 'string' || !property || property.length > 200) {
+        return res.status(400).json({ error: 'Invalid Wompi signature property.' });
+      }
+      const value = property.split('.').reduce(
+        (current, key) => current && typeof current === 'object' ? current[key] : undefined,
+        data,
+      );
+      if (value === undefined || value === null) {
+        return res.status(400).json({ error: 'Wompi event is missing a signed property.' });
+      }
+      values.push(String(value));
+    }
+
+    const expected = crypto.createHash('sha256')
+      .update(`${values.join('')}${signature.timestamp}${eventsSecret}`)
+      .digest();
+    const received = Buffer.from(signature.checksum, 'hex');
+    if (received.length !== expected.length || !crypto.timingSafeEqual(received, expected)) {
+      return res.status(401).json({ error: 'Wompi event signature verification failed.' });
+    }
+
+    if (req.body.event !== 'transaction.updated') {
+      return res.json({ received: true });
+    }
+    if (!signature.properties.includes('transaction.id')) {
+      return res.status(400).json({ error: 'Wompi transaction ID is not covered by the event signature.' });
+    }
+    const eventTransactionId = data.transaction?.id;
+    if (typeof eventTransactionId !== 'string' || !eventTransactionId) {
+      return res.status(400).json({ error: 'Wompi transaction ID is missing.' });
+    }
+
+    const apiOrigin = integration.environment === 'test'
+      ? 'https://sandbox.wompi.co'
+      : 'https://production.wompi.co';
+    const providerResponse = await fetch(
+      `${apiOrigin}/v1/transactions/${encodeURIComponent(eventTransactionId)}`,
+      {
+        headers: {
+          Accept: 'application/json',
+          Authorization: `Bearer ${privateKey}`,
+        },
+        signal: AbortSignal.timeout(10_000),
+      },
+    );
+    const providerResult = await providerResponse.json();
+    const providerTransaction = providerResult?.data;
+    if (!providerResponse.ok || providerTransaction?.id !== eventTransactionId) {
+      console.error('Wompi transaction lookup failed:', providerResponse.status);
+      return res.status(502).json({ error: 'Unable to verify the Wompi transaction.' });
+    }
+    if (typeof providerTransaction.reference !== 'string') {
+      return res.status(400).json({ error: 'Verified Wompi transaction reference is missing.' });
+    }
+
+    const referenceSnapshot = await db.collection('wompiPaymentReferences')
+      .doc(providerTransaction.reference).get();
+    if (!referenceSnapshot.exists || referenceSnapshot.data().businessId !== businessId) {
+      return res.status(404).json({ error: 'Wompi payment reference was not found.' });
+    }
+
+    const referenceData = referenceSnapshot.data();
+    const transactionRef = db.collection('businesses').doc(businessId)
+      .collection('transactions').doc(referenceData.transactionId);
+    await db.runTransaction(async (transaction) => {
+      const paymentSnapshot = await transaction.get(transactionRef);
+      if (!paymentSnapshot.exists || paymentSnapshot.data().provider !== 'wompi' ||
+          paymentSnapshot.data().providerReference !== providerTransaction.reference) {
+        const error = new Error('Wompi payment transaction does not match its reference.');
+        error.status = 409;
+        throw error;
+      }
+
+      const payment = paymentSnapshot.data();
+      if (providerTransaction.amount_in_cents !== payment.amountInCents ||
+          providerTransaction.currency !== 'COP') {
+        const error = new Error('Wompi transaction amount does not match the requested payment.');
+        error.status = 409;
+        throw error;
+      }
+      if (payment.status === 'paid') return;
+
+      const status = {
+        APPROVED: integration.environment === 'test' ? 'test_paid' : 'paid',
+        DECLINED: 'failed',
+        ERROR: 'failed',
+        VOIDED: 'failed',
+        PENDING: 'pending',
+      }[providerTransaction.status];
+      if (!status) {
+        console.error('Wompi sent an unsupported transaction status:', providerTransaction.status);
+        return;
+      }
+
+      transaction.set(transactionRef, {
+        status,
+        providerPaymentId: String(providerTransaction.id || ''),
+        updatedAt: FieldValue.serverTimestamp(),
+        ...(status === 'paid' ? { confirmedAt: FieldValue.serverTimestamp() } : {}),
+      }, { merge: true });
+    });
+
+    return res.json({ received: true });
+  } catch (error) {
+    console.error('Wompi webhook processing failed:', error);
+    return res.status(error.status || 500).json({ error: 'Wompi webhook processing failed.' });
+  }
+});
+
 app.post('/webhook/mercado-pago', async (req, res) => {
   const secret = process.env.MERCADO_PAGO_WEBHOOK_SECRET;
   const paymentId = String(req.query['data.id'] || req.body?.data?.id || '');
@@ -465,16 +828,29 @@ app.post('/api/business/bootstrap', requireFirebaseAuth, async (req, res) => {
   }
 });
 
-app.get('/api/business/me', requireFirebaseAuth, requireBusinessMember, (req, res) => {
-  res.json({
-    businessId: req.businessId,
-    name: req.business.name,
-    role: req.memberRole,
-    permissions: req.memberPermissions,
-    providers: req.business.providers || {},
-    defaultPaymentMethod: req.business.defaultPaymentMethod || '',
-    subscription: req.business.subscription || { status: 'inactive' },
-  });
+app.get('/api/business/me', requireFirebaseAuth, requireBusinessMember, async (req, res) => {
+  try {
+    const wompiIntegration = await getFirestore().collection('businesses')
+      .doc(req.businessId).collection('privateIntegrations').doc('wompi').get();
+    res.json({
+      businessId: req.businessId,
+      name: req.business.name,
+      role: req.memberRole,
+      permissions: req.memberPermissions,
+      providers: {
+        ...(req.business.providers || {}),
+        wompi: {
+          configured: wompiIntegration.exists,
+          environment: wompiIntegration.data()?.environment || null,
+        },
+      },
+      defaultPaymentMethod: req.business.defaultPaymentMethod || '',
+      subscription: req.business.subscription || { status: 'inactive' },
+    });
+  } catch (error) {
+    console.error('Business context lookup failed:', error);
+    res.status(error.status || 500).json({ error: 'Unable to load the business profile.' });
+  }
 });
 
 app.put('/api/business/profile', requireFirebaseAuth, requireBusinessMember,
@@ -505,18 +881,34 @@ app.put('/api/business/profile', requireFirebaseAuth, requireBusinessMember,
 app.put('/api/business/payment-method', requireFirebaseAuth, requireBusinessMember,
   allowRoles('owner'), async (req, res) => {
     const { method } = req.body;
-    const allowedMethods = ['bank_transfer', 'mercado_pago', 'stripe'];
+    const allowedMethods = ['bank_transfer', 'mercado_pago', 'stripe', 'wompi'];
     if (!allowedMethods.includes(method)) {
       return res.status(400).json({ error: 'Choose a supported payment method.' });
     }
 
     const providers = req.business.providers || {};
+    let wompiConfigured = false;
+    let wompiEnvironment = null;
+    if (method === 'wompi') {
+      try {
+        const wompi = await getFirestore().collection('businesses').doc(req.businessId)
+          .collection('privateIntegrations').doc('wompi').get();
+        wompiConfigured = wompi.exists;
+        wompiEnvironment = wompi.data()?.environment || null;
+      } catch (error) {
+        console.error('Wompi payment method status check failed:', error);
+        return res.status(error.status || 500).json({
+          error: 'Unable to verify the Wompi connection.',
+        });
+      }
+    }
     const configured = {
       bank_transfer: Boolean(providers.bankTransfer?.alias),
       mercado_pago: providers.mercadoPago?.status === 'connected' &&
         Boolean(providers.mercadoPago?.accessTokenEncrypted),
       stripe: Boolean(providers.stripe?.accountId) &&
         providers.stripe?.status === 'active',
+      wompi: wompiConfigured && wompiEnvironment === 'production',
     };
     if (!configured[method]) {
       return res.status(409).json({
