@@ -109,6 +109,110 @@ function requireActiveSubscription(req, res, next) {
   next();
 }
 
+async function getBusinessPaymentReadiness(businessId, business) {
+  const db = getFirestore();
+  const businessRef = db.collection('businesses').doc(businessId);
+  const [wompiSnapshot, nequiSnapshot] = await Promise.all([
+    businessRef.collection('privateIntegrations').doc('wompi').get(),
+    businessRef.collection('privateIntegrations').doc('nequi').get(),
+  ]);
+  const providers = business.providers || {};
+  const mercadoPago = providers.mercadoPago || {};
+  const stripeAccount = providers.stripe || {};
+  const bankTransfer = providers.bankTransfer || {};
+  const wompi = wompiSnapshot.data() || {};
+  const nequi = nequiSnapshot.data() || {};
+  const mercadoPagoConnected = mercadoPago.status === 'connected' &&
+    Boolean(mercadoPago.userId && mercadoPago.accessTokenEncrypted);
+  const wompiConfigured = Boolean(
+    wompiSnapshot.exists && wompi.publicKey && wompi.credentialsEncrypted,
+  );
+  const stripeOnboardingComplete = Boolean(stripeAccount.accountId) &&
+    stripeAccount.status === 'active' &&
+    stripeAccount.chargesEnabled === true &&
+    stripeAccount.payoutsEnabled === true;
+
+  return {
+    mercado_pago: {
+      ready: false,
+      status: mercadoPagoConnected ? 'pending_verification' : 'not_connected',
+      reason: mercadoPagoConnected
+        ? 'The seller is connected, but live merchant approval and production payment capability are not verified.'
+        : 'Connect a Mercado Pago seller account; a saved or incomplete connection is not payment verification.',
+    },
+    wompi: {
+      ready: false,
+      status: !wompiConfigured
+        ? wompiSnapshot.exists ? 'configuration_incomplete' : 'not_configured'
+        : wompi.environment === 'production'
+          ? 'pending_verification'
+          : wompi.environment === 'test'
+            ? 'test_only'
+            : 'configuration_incomplete',
+      reason: !wompiConfigured
+        ? wompiSnapshot.exists
+          ? 'The Wompi configuration is incomplete.'
+          : 'Wompi merchant credentials are not configured.'
+        : wompi.environment === 'production'
+          ? 'Production credentials are stored, but merchant approval and live payment readiness are not verified.'
+          : wompi.environment === 'test'
+            ? 'Wompi credentials are configured for testing, not production.'
+            : 'The Wompi environment is not verified.',
+    },
+    stripe: {
+      ready: false,
+      status: stripeOnboardingComplete
+        ? 'pending_verification'
+        : stripeAccount.accountId ? 'onboarding' : 'not_connected',
+      reason: stripeOnboardingComplete
+        ? 'Stripe account flags are present, but Stripe Connect capability for Colombian connected accounts is not verified.'
+        : stripeAccount.accountId
+          ? 'Stripe account onboarding is not verified as complete for payments.'
+          : 'No Stripe connected account is configured.',
+    },
+    nequi: {
+      ready: false,
+      status: nequiSnapshot.exists && nequi.credentialsEncrypted
+        ? 'not_implemented'
+        : 'not_configured',
+      reason: nequiSnapshot.exists && nequi.credentialsEncrypted
+        ? 'Saved credentials do not enable Nequi Push; this backend does not initiate payments or verify Nequi callbacks.'
+        : 'Nequi merchant credentials are not configured, and Push payment verification is not implemented.',
+    },
+    bank_transfer: {
+      ready: false,
+      status: bankTransfer.alias ? 'manual_verification_required' : 'not_configured',
+      reason: bankTransfer.alias
+        ? 'A receiving key is stored, but it is not provider-verified and each deposit must be checked manually.'
+        : 'No bank receiving key is configured.',
+    },
+  };
+}
+
+function requirePaymentProviderReadiness(providerId) {
+  return async (req, res, next) => {
+    try {
+      const providers = await getBusinessPaymentReadiness(
+        req.businessId,
+        req.business,
+      );
+      const provider = providers[providerId];
+      if (!provider?.ready) {
+        return res.status(409).json({
+          error: 'This payment method is unavailable until the provider confirms merchant readiness.',
+          status: provider?.status || 'not_configured',
+        });
+      }
+      next();
+    } catch (error) {
+      console.error(`Payment readiness check failed for ${providerId}:`, error);
+      res.status(error.status || 500).json({
+        error: 'Unable to verify this payment method.',
+      });
+    }
+  };
+}
+
 function encryptProviderToken(value) {
   const key = Buffer.from(process.env.PROVIDER_TOKEN_ENCRYPTION_KEY || '', 'base64');
   if (key.length !== 32) {
@@ -243,6 +347,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
               checkoutSessionId: event.data.object.id,
               customerId: event.data.object.customer,
               subscriptionId: event.data.object.subscription,
+              planId: event.data.object.metadata?.planId || null,
               updatedAt: FieldValue.serverTimestamp(),
             },
           }, { merge: true });
@@ -259,6 +364,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
               status: 'active',
               subscriptionId: subscription.id,
               customerId: subscription.customer,
+              planId: subscription.metadata?.planId || null,
               updatedAt: FieldValue.serverTimestamp(),
             },
           }, { merge: true });
@@ -275,6 +381,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
             subscription: {
               status: event.data.object.status,
               subscriptionId: event.data.object.id,
+              planId: event.data.object.metadata?.planId || null,
               updatedAt: FieldValue.serverTimestamp(),
             },
           }, { merge: true });
@@ -475,7 +582,8 @@ app.delete('/api/business/providers/wompi/credentials',
   });
 
 app.post('/api/business/wompi/create-payment', requireFirebaseAuth, requireBusinessMember,
-  allowRoles('owner', 'cashier'), requirePermission('charge'), requireActiveSubscription, async (req, res) => {
+  allowRoles('owner', 'cashier'), requirePermission('charge'), requireActiveSubscription,
+  requirePaymentProviderReadiness('wompi'), async (req, res) => {
     const { service, vehicle, amount } = req.body;
     if (typeof service !== 'string' || !service.trim() ||
         !Number.isSafeInteger(amount) || amount <= 0 ||
@@ -741,19 +849,46 @@ app.post('/webhook/mercado-pago', async (req, res) => {
     }
 
     const transactionRef = business.ref.collection('transactions').doc(transactionId);
-    const transaction = await transactionRef.get();
-    if (!transaction.exists || transaction.data().provider !== 'mercado_pago') {
-      return res.status(404).json({ error: 'Payment transaction was not found.' });
-    }
-    await transactionRef.set({
-      status: payment.status === 'approved' ? 'paid' : payment.status || 'pending',
-      providerPaymentId: String(payment.id),
-      confirmedAt: payment.status === 'approved'
-        ? FieldValue.serverTimestamp()
-        : null,
-      updatedAt: FieldValue.serverTimestamp(),
-    }, { merge: true });
-    res.json({ received: true });
+    let resultStatus;
+    await db.runTransaction(async (firestoreTransaction) => {
+      const currentSnapshot = await firestoreTransaction.get(transactionRef);
+      if (!currentSnapshot.exists || currentSnapshot.data().provider !== 'mercado_pago') {
+        const error = new Error('Payment transaction was not found.');
+        error.status = 404;
+        throw error;
+      }
+
+      const currentPayment = currentSnapshot.data();
+      const matchesOrder = String(payment.id) === paymentId &&
+        payment.transaction_amount === currentPayment.amount &&
+        payment.currency_id === currentPayment.currency;
+      if (!matchesOrder) {
+        resultStatus = 'review';
+        firestoreTransaction.set(transactionRef, {
+          status: 'review',
+          reviewReason: 'mercado_pago_amount_or_currency_mismatch',
+          providerPaymentId: String(payment.id),
+          confirmedAt: FieldValue.delete(),
+          updatedAt: FieldValue.serverTimestamp(),
+        }, { merge: true });
+        return;
+      }
+
+      if (currentPayment.status === 'paid') {
+        resultStatus = 'paid';
+        return;
+      }
+
+      resultStatus = payment.status === 'approved' ? 'paid' : payment.status || 'pending';
+      firestoreTransaction.set(transactionRef, {
+        status: resultStatus,
+        reviewReason: FieldValue.delete(),
+        providerPaymentId: String(payment.id),
+        ...(resultStatus === 'paid' ? { confirmedAt: FieldValue.serverTimestamp() } : {}),
+        updatedAt: FieldValue.serverTimestamp(),
+      }, { merge: true });
+    });
+    res.json({ received: true, status: resultStatus });
   } catch (error) {
     console.error('Mercado Pago webhook processing failed:', error);
     res.status(error.status || 500).json({ error: 'Webhook processing failed.' });
@@ -854,6 +989,20 @@ app.get('/api/business/me', requireFirebaseAuth, requireBusinessMember, async (r
     res.status(error.status || 500).json({ error: 'Unable to load the business profile.' });
   }
 });
+
+app.get('/api/business/payment-readiness',
+  requireFirebaseAuth, requireBusinessMember, async (req, res) => {
+    try {
+      const providers = await getBusinessPaymentReadiness(
+        req.businessId,
+        req.business,
+      );
+      res.json({ providers });
+    } catch (error) {
+      console.error('Payment readiness lookup failed:', error);
+      res.status(error.status || 500).json({ error: 'Unable to load payment readiness.' });
+    }
+  });
 
 app.put('/api/business/profile', requireFirebaseAuth, requireBusinessMember,
   allowRoles('owner'), async (req, res) => {
@@ -1538,7 +1687,13 @@ app.get(
         .doc('nequi');
       const snapshot = await config.get();
       const savedAt = snapshot.data()?.updatedAt?.toDate?.()?.toISOString() || null;
-      res.json({ configured: snapshot.exists, updatedAt: savedAt });
+      res.json({
+        configured: snapshot.exists,
+        ready: false,
+        status: 'not_implemented',
+        reason: 'Stored credentials do not enable Nequi Push; payment initiation and callback verification are not implemented.',
+        updatedAt: savedAt,
+      });
     } catch (error) {
       console.error('Nequi credential status check failed:', error);
       res.status(error.status || 500).json({ error: 'Unable to load Nequi setup status.' });
@@ -1615,7 +1770,8 @@ app.delete(
 );
 
 app.post('/api/business/bank-transfer/create', requireFirebaseAuth, requireBusinessMember,
-  allowRoles('owner', 'cashier'), requirePermission('charge'), requireActiveSubscription, async (req, res) => {
+  allowRoles('owner', 'cashier'), requirePermission('charge'), requireActiveSubscription,
+  requirePaymentProviderReadiness('bank_transfer'), async (req, res) => {
     const { service, vehicle, amount } = req.body;
     const bankTransfer = req.business.providers?.bankTransfer;
     if (!bankTransfer?.alias) {
@@ -1656,7 +1812,8 @@ app.post('/api/business/bank-transfer/create', requireFirebaseAuth, requireBusin
   });
 
 app.post('/api/business/mercado-pago/create-payment', requireFirebaseAuth, requireBusinessMember,
-  allowRoles('owner', 'cashier'), requirePermission('charge'), requireActiveSubscription, async (req, res) => {
+  allowRoles('owner', 'cashier'), requirePermission('charge'), requireActiveSubscription,
+  requirePaymentProviderReadiness('mercado_pago'), async (req, res) => {
     const { service, vehicle, amount } = req.body;
     if (typeof service !== 'string' || !service.trim() ||
         !Number.isSafeInteger(amount) || amount <= 0) {
@@ -2035,7 +2192,8 @@ app.post('/api/local/nequi/charge', requireFirebaseAuth, requireBusinessMember, 
 // 4. STRIPE TERMINAL & PAYMENT INTENTS
 // ==========================================
 app.post('/connectionToken', requireFirebaseAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
-  requirePermission('charge'), requireActiveSubscription, async (req, res) => {
+  requirePermission('charge'), requireActiveSubscription,
+  requirePaymentProviderReadiness('stripe'), async (req, res) => {
     try {
         requireStripe();
         const connectionToken = await stripe.terminal.connectionTokens.create();
@@ -2046,7 +2204,8 @@ app.post('/connectionToken', requireFirebaseAuth, requireBusinessMember, allowRo
 });
 
 app.post('/connection-token', requireFirebaseAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
-  requirePermission('charge'), requireActiveSubscription, async (req, res) => {
+  requirePermission('charge'), requireActiveSubscription,
+  requirePaymentProviderReadiness('stripe'), async (req, res) => {
     try {
         requireStripe();
         const connectionToken = await stripe.terminal.connectionTokens.create();
@@ -2057,7 +2216,8 @@ app.post('/connection-token', requireFirebaseAuth, requireBusinessMember, allowR
 });
 
 app.post('/create-payment-intent', requireFirebaseAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
-  requirePermission('charge'), requireActiveSubscription, async (req, res) => {
+  requirePermission('charge'), requireActiveSubscription,
+  requirePaymentProviderReadiness('stripe'), async (req, res) => {
     try {
         requireStripe();
         const { amount, service, vehicle } = req.body;
@@ -2093,7 +2253,8 @@ app.post('/create-payment-intent', requireFirebaseAuth, requireBusinessMember, a
 });
 
 app.post('/create-terminal-intent', requireFirebaseAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
-  requirePermission('charge'), requireActiveSubscription, async (req, res) => {
+  requirePermission('charge'), requireActiveSubscription,
+  requirePaymentProviderReadiness('stripe'), async (req, res) => {
   try {
     requireStripe();
     const { amount, service, vehicle } = req.body;
@@ -2144,6 +2305,27 @@ app.post('/create-checkout-session', requireFirebaseAuth, requireBusinessMember,
     }
     if (!priceId) {
       return res.status(503).json({ error: `Configure the Stripe price for the ${planId} plan in the Render environment.` });
+    }
+    const expectedPlanAmounts = {
+      barrio: 29900,
+      restaurant: 54900,
+      pharmacy: 54900,
+      station: 94900,
+      chain: 184900,
+    };
+    if (planId !== 'legacy') {
+      const configuredPrice = await stripe.prices.retrieve(priceId);
+      if (
+        !configuredPrice.active ||
+        configuredPrice.currency !== 'cop' ||
+        configuredPrice.unit_amount !== expectedPlanAmounts[planId] ||
+        configuredPrice.recurring?.interval !== 'month' ||
+        configuredPrice.recurring?.interval_count !== 1
+      ) {
+        return res.status(503).json({
+          error: `The Stripe price for the ${planId} plan must be active, monthly, and match its advertised COP amount.`,
+        });
+      }
     }
     const session = await stripe.checkout.sessions.create({
       ui_mode: 'hosted_page',
