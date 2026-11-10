@@ -3,7 +3,7 @@ const test = require('node:test');
 
 const app = require('../server');
 
-test('serves health, CORS preflight, and keeps inbox behind Firebase auth', async (context) => {
+test('serves health and CORS preflight, and requires a session for the inbox', async (context) => {
   const server = app.listen(0);
   context.after(() => new Promise((resolve, reject) => {
     server.close((error) => error ? reject(error) : resolve());

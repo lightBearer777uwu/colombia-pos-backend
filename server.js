@@ -1,13 +1,14 @@
+require('dotenv').config();
+
 const express = require('express');
 const Busboy = require('busboy');
 const app = express();
-const { cert, initializeApp } = require('firebase-admin/app');
-const { getAuth } = require('firebase-admin/auth');
 const {
   FieldValue,
   Timestamp,
-  getFirestore: getAdminFirestore,
-} = require('firebase-admin/firestore');
+  store: documentStore,
+} = require('./postgres-document-store');
+const authService = require('./auth-service');
 const crypto = require('crypto');
 const {
   hasActivePosSubscription,
@@ -86,25 +87,13 @@ function publicRateLimit({ limit, windowMs }) {
   };
 }
 
-let firebaseApp;
-try {
-  const serviceAccount = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-  if (serviceAccount) {
-    firebaseApp = initializeApp({
-      credential: cert(JSON.parse(serviceAccount)),
-    });
-  }
-} catch (error) {
-  console.error('Firebase Admin configuration is invalid:', error.message);
-}
-
-function getFirestore() {
-  if (!firebaseApp) {
-    const error = new Error('Firebase Admin is not configured on the server.');
+function getDatabase() {
+  if (!process.env.DATABASE_URL) {
+    const error = new Error('The PostgreSQL DATABASE_URL is not configured.');
     error.status = 503;
     throw error;
   }
-  return getAdminFirestore(firebaseApp);
+  return documentStore;
 }
 
 function requireStripe() {
@@ -116,25 +105,33 @@ function requireStripe() {
   return stripe;
 }
 
-async function requireFirebaseAuth(req, res, next) {
+async function requireAuth(req, res, next) {
   const authorization = req.headers.authorization || '';
   const match = authorization.match(/^Bearer (.+)$/i);
   if (!match) {
-    return res.status(401).json({ error: 'A Firebase sign-in is required.' });
+    return res.status(401).json({ error: 'A Tienda account session is required.' });
   }
 
   try {
-    req.authUser = await getAuth(firebaseApp).verifyIdToken(match[1], true);
+    const session = await authService.readSession(match[1]);
+    req.authUser = session.user;
+    req.authSessionTokenHash = session.tokenHash;
     next();
   } catch (error) {
-    console.error('Firebase token verification failed:', error.message);
-    res.status(401).json({ error: 'Your session is invalid or expired. Please sign in again.' });
+    if (error.status !== 401) {
+      console.error('Tienda session verification failed:', error);
+    }
+    res.status(error.status || 500).json({
+      error: error.status === 401
+        ? error.message
+        : 'Unable to verify your account session.',
+    });
   }
 }
 
 async function requireBusinessMember(req, res, next) {
   try {
-    const db = getFirestore();
+    const db = getDatabase();
     const businessId = req.authUser.businessId || req.authUser.uid;
     const [business, membership] = await Promise.all([
       db.collection('businesses').doc(businessId).get(),
@@ -176,7 +173,7 @@ function requirePermission(permission) {
 }
 
 async function isPaidAccessEnforced() {
-  const control = await getFirestore()
+  const control = await getDatabase()
     .collection('platformSettings')
     .doc('accessControl')
     .get();
@@ -207,7 +204,7 @@ async function requirePaidAccess(req, res, next) {
 }
 
 async function getBusinessPaymentReadiness(businessId, business) {
-  const db = getFirestore();
+  const db = getDatabase();
   const businessRef = db.collection('businesses').doc(businessId);
   const [wompiSnapshot, nequiSnapshot] = await Promise.all([
     businessRef.collection('privateIntegrations').doc('wompi').get(),
@@ -399,7 +396,7 @@ async function getMercadoPagoAccessToken(businessId, provider) {
     error.status = 502;
     throw error;
   }
-  await getFirestore().collection('businesses').doc(businessId).set({
+  await getDatabase().collection('businesses').doc(businessId).set({
     providers: {
       mercadoPago: {
         accessTokenEncrypted: encryptProviderToken(data.access_token),
@@ -436,7 +433,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     case 'checkout.session.completed':
       console.log(`Checkout Session Completed! ID: ${event.data.object.id}`);
       if (event.data.object.mode === 'subscription' && event.data.object.metadata?.businessId) {
-        await getFirestore().collection('businesses')
+        await getDatabase().collection('businesses')
           .doc(event.data.object.metadata.businessId)
           .set({
             subscription: {
@@ -456,7 +453,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
         const subscription = await stripe.subscriptions.retrieve(event.data.object.subscription);
         const businessId = subscription.metadata?.businessId;
         if (businessId) {
-          await getFirestore().collection('businesses').doc(businessId).set({
+          await getDatabase().collection('businesses').doc(businessId).set({
             subscription: {
               status: 'active',
               subscriptionId: subscription.id,
@@ -472,7 +469,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     case 'customer.subscription.deleted':
       console.log(`Subscription Cancelled/Ended: ${event.data.object.id}`);
       if (event.data.object.metadata?.businessId) {
-        await getFirestore().collection('businesses')
+        await getDatabase().collection('businesses')
           .doc(event.data.object.metadata.businessId)
           .set({
             subscription: {
@@ -486,7 +483,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
       break;
     case 'account.updated': {
       const account = event.data.object;
-      const accounts = await getFirestore().collection('businesses')
+      const accounts = await getDatabase().collection('businesses')
         .where('providers.stripe.accountId', '==', account.id).limit(1).get();
       if (!accounts.empty) {
         const status = account.details_submitted && account.charges_enabled && account.payouts_enabled
@@ -509,7 +506,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
       const intent = event.data.object;
       const businessId = intent.metadata?.businessId;
       if (businessId) {
-        await getFirestore().collection('businesses').doc(businessId)
+        await getDatabase().collection('businesses').doc(businessId)
           .collection('transactions').doc(intent.id).set({
             service: intent.metadata.service || 'Servicio',
             vehicle: intent.metadata.vehicle || '',
@@ -536,10 +533,182 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
   res.json({ received: true });
 });
 
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: false, limit: '16kb' }));
 
 const publicReadLimit = publicRateLimit({ limit: 60, windowMs: 60 * 1000 });
 const publicWriteLimit = publicRateLimit({ limit: 8, windowMs: 60 * 1000 });
+const authDeviceLimit = publicRateLimit({ limit: 10, windowMs: 15 * 60 * 1000 });
+const authSignInLimit = publicRateLimit({ limit: 10, windowMs: 15 * 60 * 1000 });
+const authEmailLimit = publicRateLimit({ limit: 5, windowMs: 15 * 60 * 1000 });
+
+app.post('/api/auth/device', authDeviceLimit, async (req, res) => {
+  try {
+    const session = await authService.createDeviceSession(
+      req.body.installationId,
+      req.body.deviceSecret,
+    );
+    res.status(201).json(session);
+  } catch (error) {
+    console.error('Creating device account failed:', error);
+    res.status(error.status || 500).json({
+      error: error.status ? error.message : 'Unable to create a device account.',
+    });
+  }
+});
+
+app.post('/api/auth/secure-account', requireAuth, authEmailLimit, async (req, res) => {
+  try {
+    if (!req.authUser.isAnonymous) {
+      return res.status(409).json({
+        error: 'This account is already protected. Sign in instead.',
+      });
+    }
+    const user = await authService.secureAnonymousAccount(
+      req.authUser.uid,
+      req.body.email,
+      req.body.password,
+    );
+    try {
+      await authService.sendVerificationEmail(user.uid);
+    } catch (error) {
+      console.error('Account created but verification email failed:', error);
+      return res.status(201).json({
+        accountSecured: true,
+        verificationEmailSent: false,
+        verificationError: error.message,
+        user,
+      });
+    }
+    return res.status(201).json({
+      accountSecured: true,
+      verificationEmailSent: true,
+      user,
+    });
+  } catch (error) {
+    console.error('Securing account failed:', error);
+    return res.status(error.status || 500).json({
+      error: error.status ? error.message : 'Unable to secure this account.',
+    });
+  }
+});
+
+app.post('/api/auth/sign-in', authSignInLimit, async (req, res) => {
+  try {
+    res.json(await authService.signIn(req.body.email, req.body.password));
+  } catch (error) {
+    if (error.status !== 401) {
+      console.error('Account sign-in failed:', error);
+    }
+    res.status(error.status || 500).json({
+      error: error.status === 401
+        ? error.message
+        : 'Unable to sign in. Please retry.',
+    });
+  }
+});
+
+app.get('/api/auth/session', requireAuth, (req, res) => {
+  res.json({ user: req.authUser });
+});
+
+app.post('/api/auth/sign-out', requireAuth, async (req, res) => {
+  try {
+    await authService.signOut(req.authSessionTokenHash);
+    res.json({ signedOut: true });
+  } catch (error) {
+    console.error('Signing out failed:', error);
+    res.status(500).json({ error: 'Unable to close this session.' });
+  }
+});
+
+app.post('/api/auth/verification-email', requireAuth, authEmailLimit, async (req, res) => {
+  try {
+    res.json(await authService.sendVerificationEmail(req.authUser.uid));
+  } catch (error) {
+    console.error('Sending account verification failed:', error);
+    res.status(error.status || 502).json({
+      error: error.status ? error.message : 'Unable to send the verification email.',
+    });
+  }
+});
+
+app.get('/api/auth/email/verify', async (req, res) => {
+  try {
+    await authService.verifyEmail(req.query.token);
+    res.set('Cache-Control', 'no-store');
+    res.type('html').send(
+      '<!doctype html><html lang="en"><meta charset="utf-8">' +
+      '<meta name="viewport" content="width=device-width,initial-scale=1">' +
+      '<title>Email verified</title><h1>Email verified</h1>' +
+      '<p>Your Tienda account is verified. You can return to the app.</p></html>',
+    );
+  } catch (error) {
+    res.status(error.status || 500).type('text').send(
+      error.status
+        ? error.message
+        : 'Unable to verify this account. Please retry later.',
+    );
+  }
+});
+
+app.post('/api/auth/password-reset/request', authEmailLimit, async (req, res) => {
+  try {
+    res.status(202).json(await authService.requestPasswordReset(req.body.email));
+  } catch (error) {
+    console.error('Password reset request failed:', error);
+    res.status(error.status || 502).json({
+      error: error.status ? error.message : 'Unable to send password-reset instructions.',
+    });
+  }
+});
+
+app.get('/api/auth/password-reset', (req, res) => {
+  const token = typeof req.query.token === 'string' &&
+      /^[A-Za-z0-9_-]{40,64}$/.test(req.query.token)
+    ? req.query.token
+    : '';
+  if (!token) {
+    return res.status(400).type('text').send('This password-reset link is invalid.');
+  }
+  res.set({
+    'Cache-Control': 'no-store',
+    'Content-Security-Policy': "default-src 'none'; form-action 'self'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'",
+    'X-Content-Type-Options': 'nosniff',
+  });
+  return res.type('html').send(
+    '<!doctype html><html lang="en"><meta charset="utf-8">' +
+    '<meta name="viewport" content="width=device-width,initial-scale=1">' +
+    '<title>Reset password</title><h1>Reset your Tienda password</h1>' +
+    '<form method="post" action="/api/auth/password-reset/confirm">' +
+    `<input type="hidden" name="token" value="${token}">` +
+    '<label>New password <input type="password" name="password" minlength="12" maxlength="1024" required autocomplete="new-password"></label>' +
+    '<button type="submit">Save password</button></form></html>',
+  );
+});
+
+app.post('/api/auth/password-reset/confirm', async (req, res) => {
+  try {
+    await authService.resetPassword(req.body.token, req.body.password);
+    if (req.is('application/json')) {
+      return res.json({ passwordReset: true });
+    }
+    return res.type('html').send(
+      '<!doctype html><html lang="en"><meta charset="utf-8">' +
+      '<title>Password updated</title><h1>Password updated</h1>' +
+      '<p>Sign in to Tienda using your new password.</p></html>',
+    );
+  } catch (error) {
+    if (req.is('application/json')) {
+      return res.status(error.status || 500).json({
+        error: error.status ? error.message : 'Unable to reset the password.',
+      });
+    }
+    return res.status(error.status || 500).type('text').send(
+      error.status ? error.message : 'Unable to reset the password.',
+    );
+  }
+});
 
 async function recordInboundMessage({ db, businessId, customerSnapshot, channel, text }) {
   const customer = customerSnapshot.data();
@@ -599,7 +768,7 @@ app.post('/webhook/twilio/inbound',
         return res.status(400).send('Invalid sender or recipient.');
       }
       const field = channel === 'whatsapp' ? 'whatsappNumber' : 'smsNumber';
-      const db = getFirestore();
+      const db = getDatabase();
       const businesses = await db.collection('businesses')
         .where(`customerEngagement.${field}`, '==', to)
         .limit(2)
@@ -688,7 +857,7 @@ app.post('/webhook/sendgrid/inbound/:secret',
       if (!replyAddress) return res.status(200).send('Message ignored.');
       const replyToken = replyAddress.match(/^reply\+([a-f0-9]{32})@/i)?.[1];
       if (!replyToken) return res.status(200).send('Message ignored.');
-      const db = getFirestore();
+      const db = getDatabase();
       const route = await db.collection('conversationRoutes').doc(replyToken).get();
       if (!route.exists || route.data().channel !== 'email') {
         return res.status(200).send('Message ignored.');
@@ -742,10 +911,10 @@ app.post('/webhook/sendgrid/inbound/:secret',
   });
 
 app.get('/api/business/providers/wompi/credentials',
-  requireFirebaseAuth, requireBusinessMember, allowRoles('owner'), requirePaidAccess,
+  requireAuth, requireBusinessMember, allowRoles('owner'), requirePaidAccess,
   async (req, res) => {
     try {
-      const snapshot = await getFirestore().collection('businesses').doc(req.businessId)
+      const snapshot = await getDatabase().collection('businesses').doc(req.businessId)
         .collection('privateIntegrations').doc('wompi').get();
       const integration = snapshot.data();
       res.json({
@@ -764,7 +933,7 @@ app.get('/api/business/providers/wompi/credentials',
   });
 
 app.put('/api/business/providers/wompi/credentials',
-  requireFirebaseAuth, requireBusinessMember, allowRoles('owner'), requirePaidAccess,
+  requireAuth, requireBusinessMember, allowRoles('owner'), requirePaidAccess,
   async (req, res) => {
     const { publicKey, privateKey, integritySecret, eventsSecret } = req.body;
     const environment = typeof publicKey === 'string' && publicKey.startsWith('pub_test_')
@@ -805,7 +974,7 @@ app.put('/api/business/providers/wompi/credentials',
     }
 
     try {
-      const db = getFirestore();
+      const db = getDatabase();
       const pendingPayments = await db.collection('businesses').doc(req.businessId)
         .collection('transactions').where('status', '==', 'pending').get();
       if (pendingPayments.docs.some((payment) => payment.data().provider === 'wompi')) {
@@ -852,10 +1021,10 @@ app.put('/api/business/providers/wompi/credentials',
   });
 
 app.delete('/api/business/providers/wompi/credentials',
-  requireFirebaseAuth, requireBusinessMember, allowRoles('owner'), requirePaidAccess,
+  requireAuth, requireBusinessMember, allowRoles('owner'), requirePaidAccess,
   async (req, res) => {
     try {
-      const db = getFirestore();
+      const db = getDatabase();
       const pendingPayments = await db.collection('businesses').doc(req.businessId)
         .collection('transactions').where('status', '==', 'pending').get();
       if (pendingPayments.docs.some((payment) => payment.data().provider === 'wompi')) {
@@ -884,7 +1053,7 @@ app.delete('/api/business/providers/wompi/credentials',
     }
   });
 
-app.post('/api/business/wompi/create-payment', requireFirebaseAuth, requireBusinessMember,
+app.post('/api/business/wompi/create-payment', requireAuth, requireBusinessMember,
   allowRoles('owner', 'cashier'), requirePermission('charge'), requirePaidAccess,
   requirePaymentProviderReadiness('wompi'), async (req, res) => {
     const { service, vehicle, amount } = req.body;
@@ -897,7 +1066,7 @@ app.post('/api/business/wompi/create-payment', requireFirebaseAuth, requireBusin
     let transactionRef;
     let reference;
     try {
-      const db = getFirestore();
+      const db = getDatabase();
       const integrationSnapshot = await db.collection('businesses').doc(req.businessId)
         .collection('privateIntegrations').doc('wompi').get();
       const integration = integrationSnapshot.data();
@@ -969,7 +1138,7 @@ app.post('/webhook/wompi/:routeToken', async (req, res) => {
     if (!/^[a-f0-9]{64}$/.test(req.params.routeToken)) {
       return res.status(404).json({ error: 'Wompi webhook route was not found.' });
     }
-    const db = getFirestore();
+    const db = getDatabase();
     const routeSnapshot = await db.collection('wompiWebhookRoutes')
       .doc(req.params.routeToken).get();
     if (!routeSnapshot.exists) {
@@ -1129,7 +1298,7 @@ app.post('/webhook/mercado-pago', async (req, res) => {
   }
 
   try {
-    const db = getFirestore();
+    const db = getDatabase();
     const sellerId = req.body?.user_id || req.query.user_id;
     if (!sellerId) return res.status(400).json({ error: 'Missing Mercado Pago seller ID.' });
     const businesses = await db.collection('businesses')
@@ -1153,8 +1322,8 @@ app.post('/webhook/mercado-pago', async (req, res) => {
 
     const transactionRef = business.ref.collection('transactions').doc(transactionId);
     let resultStatus;
-    await db.runTransaction(async (firestoreTransaction) => {
-      const currentSnapshot = await firestoreTransaction.get(transactionRef);
+    await db.runTransaction(async (dbTransaction) => {
+      const currentSnapshot = await dbTransaction.get(transactionRef);
       if (!currentSnapshot.exists || currentSnapshot.data().provider !== 'mercado_pago') {
         const error = new Error('Payment transaction was not found.');
         error.status = 404;
@@ -1167,7 +1336,7 @@ app.post('/webhook/mercado-pago', async (req, res) => {
         payment.currency_id === currentPayment.currency;
       if (!matchesOrder) {
         resultStatus = 'review';
-        firestoreTransaction.set(transactionRef, {
+        dbTransaction.set(transactionRef, {
           status: 'review',
           reviewReason: 'mercado_pago_amount_or_currency_mismatch',
           providerPaymentId: String(payment.id),
@@ -1183,7 +1352,7 @@ app.post('/webhook/mercado-pago', async (req, res) => {
       }
 
       resultStatus = payment.status === 'approved' ? 'paid' : payment.status || 'pending';
-      firestoreTransaction.set(transactionRef, {
+      dbTransaction.set(transactionRef, {
         status: resultStatus,
         reviewReason: FieldValue.delete(),
         providerPaymentId: String(payment.id),
@@ -1202,14 +1371,14 @@ app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     revision: process.env.RENDER_GIT_COMMIT || null,
-    firebaseConfigured: Boolean(firebaseApp),
+    databaseConfigured: Boolean(process.env.DATABASE_URL),
     stripeConfigured: Boolean(stripe),
   });
 });
 
-app.post('/api/business/bootstrap', requireFirebaseAuth, async (req, res) => {
+app.post('/api/business/bootstrap', requireAuth, async (req, res) => {
   try {
-    const db = getFirestore();
+    const db = getDatabase();
     const uid = req.authUser.uid;
     const claimedBusinessId = req.authUser.businessId;
     if (typeof claimedBusinessId === 'string' && claimedBusinessId.length > 0) {
@@ -1260,6 +1429,7 @@ app.post('/api/business/bootstrap', requireFirebaseAuth, async (req, res) => {
       });
     });
 
+    await authService.setBusinessId(uid, uid);
     res.json({ businessId: uid, role: 'owner' });
   } catch (error) {
     console.error('Business bootstrap failed:', error);
@@ -1267,9 +1437,9 @@ app.post('/api/business/bootstrap', requireFirebaseAuth, async (req, res) => {
   }
 });
 
-app.get('/api/business/me', requireFirebaseAuth, requireBusinessMember, async (req, res) => {
+app.get('/api/business/me', requireAuth, requireBusinessMember, async (req, res) => {
   try {
-    const wompiIntegration = await getFirestore().collection('businesses')
+    const wompiIntegration = await getDatabase().collection('businesses')
       .doc(req.businessId).collection('privateIntegrations').doc('wompi').get();
     res.json({
       businessId: req.businessId,
@@ -1294,7 +1464,7 @@ app.get('/api/business/me', requireFirebaseAuth, requireBusinessMember, async (r
 });
 
 app.get('/api/business/payment-readiness',
-  requireFirebaseAuth, requireBusinessMember, async (req, res) => {
+  requireAuth, requireBusinessMember, async (req, res) => {
     try {
       const providers = await getBusinessPaymentReadiness(
         req.businessId,
@@ -1363,7 +1533,7 @@ function enqueueCustomerAppointmentReminder(transaction, {
 }
 
 app.get('/api/business/customer-engagement/settings',
-  requireFirebaseAuth, requireBusinessMember, requirePaidAccess, async (req, res) => {
+  requireAuth, requireBusinessMember, requirePaidAccess, async (req, res) => {
     const settings = getCustomerEngagementSettings(req.business);
     res.json({
       settings,
@@ -1379,7 +1549,7 @@ app.get('/api/business/customer-engagement/settings',
   });
 
 app.put('/api/business/customer-engagement/settings',
-  requireFirebaseAuth, requireBusinessMember, allowRoles('owner'), requirePaidAccess,
+  requireAuth, requireBusinessMember, allowRoles('owner'), requirePaidAccess,
   async (req, res) => {
     const validationError = validateCustomerEngagementSettings(req.body);
     if (validationError) return res.status(400).json({ error: validationError });
@@ -1407,7 +1577,7 @@ app.put('/api/business/customer-engagement/settings',
         Boolean(process.env.PRIVATE_AI_URL && process.env.PRIVATE_AI_API_KEY),
     };
     try {
-      const db = getFirestore();
+      const db = getDatabase();
       const businessRef = db.collection('businesses').doc(req.businessId);
       const oldSlug = req.business.customerEngagement?.publicBookingSlug || '';
       const newSlug = settings.publicBookingEnabled
@@ -1858,7 +2028,7 @@ app.post('/api/internal/appointment-reminders', async (req, res) => {
     return res.status(401).json({ error: 'Unauthorized reminder job.' });
   }
   try {
-    res.json(await processDueAppointmentReminders(getFirestore()));
+    res.json(await processDueAppointmentReminders(getDatabase()));
   } catch (error) {
     console.error('Scheduled appointment reminders could not be processed:', error);
     res.status(500).json({ error: 'Unable to process scheduled appointment reminders.' });
@@ -1868,7 +2038,7 @@ app.post('/api/internal/appointment-reminders', async (req, res) => {
 app.get('/api/public/businesses/:slug',
   publicReadLimit, async (req, res) => {
     try {
-      const business = await findPublicBusiness(getFirestore(), req.params.slug);
+      const business = await findPublicBusiness(getDatabase(), req.params.slug);
       if (!business) return res.status(404).json({ error: 'Public booking page not found.' });
       res.json({
         business: {
@@ -1893,7 +2063,7 @@ app.get('/api/public/businesses/:slug',
 app.get('/api/public/businesses/:slug/availability',
   publicReadLimit, async (req, res) => {
     try {
-      const db = getFirestore();
+      const db = getDatabase();
       const business = await findPublicBusiness(db, req.params.slug);
       if (!business) return res.status(404).json({ error: 'Public booking page not found.' });
       if (!(await publicBusinessHasPaidAccess(business))) {
@@ -1958,7 +2128,7 @@ app.post('/api/public/businesses/:slug/book',
     const validationError = validatePublicBooking(req.body);
     if (validationError) return res.status(400).json({ error: validationError });
     try {
-      const db = getFirestore();
+      const db = getDatabase();
       const business = await findPublicBusiness(db, req.params.slug);
       if (!business) return res.status(404).json({ error: 'Public booking page not found.' });
       if (!(await publicBusinessHasPaidAccess(business))) {
@@ -2094,11 +2264,11 @@ app.post('/api/public/businesses/:slug/book',
   });
 
 app.get('/api/business/customers',
-  requireFirebaseAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
+  requireAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
   requirePermission('charge'), requirePaidAccess,
   async (req, res) => {
     try {
-      const snapshot = await getFirestore().collection('businesses').doc(req.businessId)
+      const snapshot = await getDatabase().collection('businesses').doc(req.businessId)
         .collection('customers').orderBy('updatedAt', 'desc').limit(200).get();
       res.json({
         customers: snapshot.docs.map((customer) => ({
@@ -2113,7 +2283,7 @@ app.get('/api/business/customers',
   });
 
 app.post('/api/business/customers',
-  requireFirebaseAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
+  requireAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
   requirePermission('charge'), requirePaidAccess,
   async (req, res) => {
     const validationError = validateCustomerContact(req.body);
@@ -2125,7 +2295,7 @@ app.post('/api/business/customers',
     }
 
     try {
-      const ref = getFirestore().collection('businesses').doc(req.businessId)
+      const ref = getDatabase().collection('businesses').doc(req.businessId)
         .collection('customers').doc();
       const customer = {
         name: req.body.name.trim(),
@@ -2158,7 +2328,7 @@ app.post('/api/business/customers',
   });
 
 app.patch('/api/business/customers/:customerId/consent',
-  requireFirebaseAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
+  requireAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
   requirePermission('charge'), requirePaidAccess,
   async (req, res) => {
     const revokeChannels = req.body.revokeChannels;
@@ -2172,7 +2342,7 @@ app.patch('/api/business/customers/:customerId/consent',
     }
 
     try {
-      const ref = getFirestore().collection('businesses').doc(req.businessId)
+      const ref = getDatabase().collection('businesses').doc(req.businessId)
         .collection('customers').doc(req.params.customerId);
       const snapshot = await ref.get();
       if (!snapshot.exists) {
@@ -2217,10 +2387,10 @@ app.patch('/api/business/customers/:customerId/consent',
   });
 
 app.get('/api/business/reminders',
-  requireFirebaseAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
+  requireAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
   requirePermission('charge'), requirePaidAccess, async (req, res) => {
     try {
-      const snapshot = await getFirestore().collection('businesses')
+      const snapshot = await getDatabase().collection('businesses')
         .doc(req.businessId).collection('vendorReminders')
         .orderBy('remindAt', 'asc').limit(200).get();
       res.json({
@@ -2240,7 +2410,7 @@ app.get('/api/business/reminders',
   });
 
 app.post('/api/business/reminders',
-  requireFirebaseAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
+  requireAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
   requirePermission('charge'), requirePaidAccess, async (req, res) => {
     const validationError = validateVendorReminder(req.body);
     if (validationError) return res.status(400).json({ error: validationError });
@@ -2255,7 +2425,7 @@ app.post('/api/business/reminders',
         createdAt: FieldValue.serverTimestamp(),
         updatedAt: FieldValue.serverTimestamp(),
       };
-      const ref = await getFirestore().collection('businesses')
+      const ref = await getDatabase().collection('businesses')
         .doc(req.businessId).collection('vendorReminders').add(reminder);
       res.status(201).json({
         reminder: {
@@ -2273,13 +2443,13 @@ app.post('/api/business/reminders',
   });
 
 app.patch('/api/business/reminders/:reminderId',
-  requireFirebaseAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
+  requireAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
   requirePermission('charge'), requirePaidAccess, async (req, res) => {
     if (typeof req.body.completed !== 'boolean') {
       return res.status(400).json({ error: 'Specify whether the reminder is complete.' });
     }
     try {
-      const ref = getFirestore().collection('businesses').doc(req.businessId)
+      const ref = getDatabase().collection('businesses').doc(req.businessId)
         .collection('vendorReminders').doc(req.params.reminderId);
       const snapshot = await ref.get();
       if (!snapshot.exists) {
@@ -2300,13 +2470,13 @@ app.patch('/api/business/reminders/:reminderId',
   });
 
 app.get('/api/business/appointments',
-  requireFirebaseAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
+  requireAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
   requirePermission('charge'), requirePaidAccess, async (req, res) => {
     try {
       const recentFrom = Timestamp.fromDate(
         new Date(Date.now() - 90 * 24 * 60 * 60 * 1000),
       );
-      const snapshot = await getFirestore().collection('businesses').doc(req.businessId)
+      const snapshot = await getDatabase().collection('businesses').doc(req.businessId)
         .collection('appointments')
         .where('startAt', '>=', recentFrom)
         .orderBy('startAt', 'asc')
@@ -2331,7 +2501,7 @@ app.get('/api/business/appointments',
   });
 
 app.post('/api/business/appointments',
-  requireFirebaseAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
+  requireAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
   requirePermission('charge'), requirePaidAccess, async (req, res) => {
     const customerId = typeof req.body.customerId === 'string'
       ? req.body.customerId.trim()
@@ -2353,7 +2523,7 @@ app.post('/api/business/appointments',
     }
 
     try {
-      const db = getFirestore();
+      const db = getDatabase();
       const businessRef = db.collection('businesses').doc(req.businessId);
       const customerRef = businessRef.collection('customers').doc(customerId);
       const settings = getCustomerEngagementSettings(req.business);
@@ -2491,7 +2661,7 @@ app.post('/api/business/appointments',
   });
 
 app.patch('/api/business/appointments/:appointmentId/status',
-  requireFirebaseAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
+  requireAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
   requirePermission('charge'), requirePaidAccess, async (req, res) => {
     const nextStatus = req.body.status;
     if (!['confirmed', 'declined', 'cancelled'].includes(nextStatus)) {
@@ -2499,7 +2669,7 @@ app.patch('/api/business/appointments/:appointmentId/status',
     }
 
     try {
-      const db = getFirestore();
+      const db = getDatabase();
       const businessRef = db.collection('businesses').doc(req.businessId);
       const appointmentRef = businessRef.collection('appointments')
         .doc(req.params.appointmentId);
@@ -2594,10 +2764,10 @@ app.patch('/api/business/appointments/:appointmentId/status',
   });
 
 app.get('/api/business/conversations',
-  requireFirebaseAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
+  requireAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
   requirePermission('charge'), requirePaidAccess, async (req, res) => {
     try {
-      const snapshot = await getFirestore().collection('businesses').doc(req.businessId)
+      const snapshot = await getDatabase().collection('businesses').doc(req.businessId)
         .collection('conversations').orderBy('updatedAt', 'desc').limit(100).get();
       res.json({
         conversations: snapshot.docs.map((doc) => ({
@@ -2618,10 +2788,10 @@ app.get('/api/business/conversations',
   });
 
 app.get('/api/business/conversations/:conversationId/messages',
-  requireFirebaseAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
+  requireAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
   requirePermission('charge'), requirePaidAccess, async (req, res) => {
     try {
-      const conversationRef = getFirestore().collection('businesses')
+      const conversationRef = getDatabase().collection('businesses')
         .doc(req.businessId).collection('conversations').doc(req.params.conversationId);
       const [conversation, messages] = await Promise.all([
         conversationRef.get(),
@@ -2651,7 +2821,7 @@ app.get('/api/business/conversations/:conversationId/messages',
   });
 
 app.post('/api/business/conversations',
-  requireFirebaseAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
+  requireAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
   requirePermission('charge'), requirePaidAccess, async (req, res) => {
     const customerId = typeof req.body.customerId === 'string'
       ? req.body.customerId.trim()
@@ -2663,7 +2833,7 @@ app.post('/api/business/conversations',
     }
     if (validationError) return res.status(400).json({ error: validationError });
     try {
-      const db = getFirestore();
+      const db = getDatabase();
       const customerRef = db.collection('businesses').doc(req.businessId)
         .collection('customers').doc(customerId);
       const customerSnapshot = await customerRef.get();
@@ -2687,7 +2857,7 @@ app.post('/api/business/conversations',
   });
 
 app.post('/api/business/conversations/:conversationId/ai-draft',
-  requireFirebaseAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
+  requireAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
   requirePermission('charge'), requirePaidAccess, async (req, res) => {
     if (process.env.PRIVATE_AI_ENABLED !== 'true' ||
         !process.env.PRIVATE_AI_URL || !process.env.PRIVATE_AI_API_KEY) {
@@ -2698,7 +2868,7 @@ app.post('/api/business/conversations/:conversationId/ai-draft',
       if (endpoint.protocol !== 'https:' || endpoint.username || endpoint.password) {
         return res.status(503).json({ error: 'The private AI endpoint must be a secure HTTPS URL.' });
       }
-      const db = getFirestore();
+      const db = getDatabase();
       const businessRef = db.collection('businesses').doc(req.businessId);
       const conversationRef = businessRef.collection('conversations')
         .doc(req.params.conversationId);
@@ -2767,7 +2937,7 @@ app.post('/api/business/conversations/:conversationId/ai-draft',
     }
   });
 
-app.put('/api/business/profile', requireFirebaseAuth, requireBusinessMember,
+app.put('/api/business/profile', requireAuth, requireBusinessMember,
   allowRoles('owner'), async (req, res) => {
     const name = typeof req.body.name === 'string'
       ? req.body.name.trim()
@@ -2779,7 +2949,7 @@ app.put('/api/business/profile', requireFirebaseAuth, requireBusinessMember,
     }
 
     try {
-      await getFirestore().collection('businesses').doc(req.businessId).set({
+      await getDatabase().collection('businesses').doc(req.businessId).set({
         name,
         updatedAt: FieldValue.serverTimestamp(),
       }, { merge: true });
@@ -2792,7 +2962,7 @@ app.put('/api/business/profile', requireFirebaseAuth, requireBusinessMember,
     }
   });
 
-app.put('/api/business/profile/settings', requireFirebaseAuth, requireBusinessMember,
+app.put('/api/business/profile/settings', requireAuth, requireBusinessMember,
   allowRoles('owner'), async (req, res) => {
   const { name, businessType, operatingModel, locationCount } = req.body;
     const businessTypes = [
@@ -2826,7 +2996,7 @@ app.put('/api/business/profile/settings', requireFirebaseAuth, requireBusinessMe
 
     try {
       const businessProfile = { businessType, operatingModel, locationCount };
-      await getFirestore().collection('businesses').doc(req.businessId).set({
+      await getDatabase().collection('businesses').doc(req.businessId).set({
         name: businessName,
         businessProfile,
         updatedAt: FieldValue.serverTimestamp(),
@@ -2840,7 +3010,7 @@ app.put('/api/business/profile/settings', requireFirebaseAuth, requireBusinessMe
     }
   });
 
-app.put('/api/business/payment-method', requireFirebaseAuth, requireBusinessMember,
+app.put('/api/business/payment-method', requireAuth, requireBusinessMember,
   allowRoles('owner'), requirePaidAccess, async (req, res) => {
     const { method } = req.body;
     const allowedMethods = ['bank_transfer', 'mercado_pago', 'stripe', 'wompi'];
@@ -2853,7 +3023,7 @@ app.put('/api/business/payment-method', requireFirebaseAuth, requireBusinessMemb
     let wompiEnvironment = null;
     if (method === 'wompi') {
       try {
-        const wompi = await getFirestore().collection('businesses').doc(req.businessId)
+        const wompi = await getDatabase().collection('businesses').doc(req.businessId)
           .collection('privateIntegrations').doc('wompi').get();
         wompiConfigured = wompi.exists;
         wompiEnvironment = wompi.data()?.environment || null;
@@ -2879,7 +3049,7 @@ app.put('/api/business/payment-method', requireFirebaseAuth, requireBusinessMemb
     }
 
     try {
-      await getFirestore().collection('businesses').doc(req.businessId).set({
+      await getDatabase().collection('businesses').doc(req.businessId).set({
         defaultPaymentMethod: method,
         updatedAt: FieldValue.serverTimestamp(),
       }, { merge: true });
@@ -2890,10 +3060,10 @@ app.put('/api/business/payment-method', requireFirebaseAuth, requireBusinessMemb
     }
   });
 
-app.get('/api/business/members', requireFirebaseAuth, requireBusinessMember,
+app.get('/api/business/members', requireAuth, requireBusinessMember,
   allowRoles('owner'), requirePaidAccess, async (req, res) => {
     try {
-      const members = await getFirestore().collection('businesses').doc(req.businessId)
+      const members = await getDatabase().collection('businesses').doc(req.businessId)
         .collection('members').get();
       res.json({
         members: members.docs.map((member) => {
@@ -2912,7 +3082,7 @@ app.get('/api/business/members', requireFirebaseAuth, requireBusinessMember,
     }
   });
 
-app.post('/api/business/invitations', requireFirebaseAuth, requireBusinessMember,
+app.post('/api/business/invitations', requireAuth, requireBusinessMember,
   allowRoles('owner'), requirePaidAccess, async (req, res) => {
     if (req.authUser.email_verified !== true) {
       return res.status(403).json({
@@ -2942,7 +3112,7 @@ app.post('/api/business/invitations', requireFirebaseAuth, requireBusinessMember
     try {
       const token = crypto.randomBytes(32).toString('base64url');
       const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
-      await getFirestore().collection('businessInvitations').doc(tokenHash).create({
+      await getDatabase().collection('businessInvitations').doc(tokenHash).create({
         businessId: req.businessId,
         email,
         role,
@@ -2967,7 +3137,7 @@ app.post('/api/business/invitations', requireFirebaseAuth, requireBusinessMember
     }
   });
 
-app.post('/api/business/invitations/accept', requireFirebaseAuth, async (req, res) => {
+app.post('/api/business/invitations/accept', requireAuth, async (req, res) => {
   const invitationCode = typeof req.body.invitationCode === 'string'
     ? req.body.invitationCode.trim()
     : '';
@@ -2981,7 +3151,7 @@ app.post('/api/business/invitations/accept', requireFirebaseAuth, async (req, re
   }
 
   const tokenHash = crypto.createHash('sha256').update(invitationCode).digest('hex');
-  const db = getFirestore();
+  const db = getDatabase();
   const invitationRef = db.collection('businessInvitations').doc(tokenHash);
   let acceptedBusinessId;
   try {
@@ -3106,11 +3276,7 @@ app.post('/api/business/invitations/accept', requireFirebaseAuth, async (req, re
       });
     });
 
-    const user = await getAuth(firebaseApp).getUser(req.authUser.uid);
-    await getAuth(firebaseApp).setCustomUserClaims(user.uid, {
-      ...(user.customClaims || {}),
-      businessId: acceptedBusinessId,
-    });
+    await authService.setBusinessId(req.authUser.uid, acceptedBusinessId);
     res.json({ businessId: acceptedBusinessId, accepted: true });
   } catch (error) {
     if (error.status) {
@@ -3121,7 +3287,7 @@ app.post('/api/business/invitations/accept', requireFirebaseAuth, async (req, re
   }
 });
 
-app.post('/api/business/members', requireFirebaseAuth, requireBusinessMember,
+app.post('/api/business/members', requireAuth, requireBusinessMember,
   allowRoles('owner'), requirePaidAccess, async (req, res) => {
     if (req.authUser.email_verified !== true) {
       return res.status(403).json({
@@ -3141,7 +3307,7 @@ app.post('/api/business/members', requireFirebaseAuth, requireBusinessMember,
     }
 
     try {
-      const user = await getAuth(firebaseApp).getUserByEmail(email);
+      const user = await authService.getUserByEmail(email);
       if (!user.emailVerified) {
         return res.status(409).json({
           error: 'The employee must verify their email address before being added.',
@@ -3154,12 +3320,12 @@ app.post('/api/business/members', requireFirebaseAuth, requireBusinessMember,
         return res.status(409).json({ error: 'This employee already belongs to another business.' });
       }
       if (user.uid !== req.businessId) {
-        const ownedBusiness = await getFirestore().collection('businesses').doc(user.uid).get();
+        const ownedBusiness = await getDatabase().collection('businesses').doc(user.uid).get();
         if (ownedBusiness.exists && ownedBusiness.data().ownerUid === user.uid) {
           return res.status(409).json({ error: 'A business owner cannot be added as an employee to another business.' });
         }
       }
-      const ref = getFirestore().collection('businesses').doc(req.businessId)
+      const ref = getDatabase().collection('businesses').doc(req.businessId)
         .collection('members').doc(user.uid);
       await ref.set({
         uid: user.uid,
@@ -3169,37 +3335,34 @@ app.post('/api/business/members', requireFirebaseAuth, requireBusinessMember,
         permissions: Object.fromEntries(permissionNames.map((name) => [name, permissions[name] === true])),
         updatedAt: FieldValue.serverTimestamp(),
       }, { merge: true });
-      await getAuth(firebaseApp).setCustomUserClaims(user.uid, {
-        ...(user.customClaims || {}),
-        businessId: req.businessId,
-      });
+      await authService.setBusinessId(user.uid, req.businessId);
       res.status(201).json({ uid: user.uid, email, role, active: true });
     } catch (error) {
       if (error.code === 'auth/user-not-found') {
         return res.status(404).json({ error: 'The employee must create a sign-in account before being added.' });
       }
       console.error('Adding business member failed:', error);
-      res.status(500).json({ error: 'Unable to add this employee.' });
+      res.status(error.status || 500).json({
+        error: error.status ? error.message : 'Unable to add this employee.',
+      });
     }
   });
 
-app.delete('/api/business/members/:uid', requireFirebaseAuth, requireBusinessMember,
+app.delete('/api/business/members/:uid', requireAuth, requireBusinessMember,
   allowRoles('owner'), async (req, res) => {
     if (req.params.uid === req.authUser.uid) {
       return res.status(400).json({ error: 'The business owner cannot remove their own access.' });
     }
     try {
-      const member = getFirestore().collection('businesses').doc(req.businessId)
+      const member = getDatabase().collection('businesses').doc(req.businessId)
         .collection('members').doc(req.params.uid);
       await member.update({
         active: false,
         revokedAt: FieldValue.serverTimestamp(),
       });
-      const user = await getAuth(firebaseApp).getUser(req.params.uid);
-      const claims = { ...(user.customClaims || {}) };
-      if (claims.businessId === req.businessId) {
-        delete claims.businessId;
-        await getAuth(firebaseApp).setCustomUserClaims(req.params.uid, claims);
+      const user = await authService.getUser(req.params.uid);
+      if (user.customClaims?.businessId === req.businessId) {
+        await authService.setBusinessId(req.params.uid, null);
       }
       res.json({ revoked: true });
     } catch (error) {
@@ -3208,10 +3371,145 @@ app.delete('/api/business/members/:uid', requireFirebaseAuth, requireBusinessMem
     }
   });
 
-app.get('/api/business/transactions', requireFirebaseAuth, requireBusinessMember,
+app.get('/api/business/inventory', requireAuth, requireBusinessMember,
+  requirePaidAccess, requirePermission('viewInventory'), async (req, res) => {
+    try {
+      const snapshot = await getDatabase().collection('businesses')
+        .doc(req.businessId).collection('inventory').get();
+      res.json({
+        records: snapshot.docs.map((document) => ({
+          documentId: document.id,
+          record: document.data(),
+        })),
+      });
+    } catch (error) {
+      console.error('Loading business inventory failed:', error);
+      res.status(error.status || 500).json({
+        error: 'Unable to load the business inventory.',
+      });
+    }
+  });
+
+app.post('/api/business/inventory/sync', requireAuth, requireBusinessMember,
+  requirePaidAccess, requirePermission('manageInventory'), async (req, res) => {
+    const records = req.body.records;
+    const allowedFields = new Set([
+      'kind',
+      'id',
+      'business_id',
+      'name',
+      'is_default',
+      'updated_at',
+      'barcode',
+      'sku',
+      'price_cop',
+      'cost_cop',
+      'image_url',
+      'product_id',
+      'location_id',
+      'quantity',
+      'product_name',
+      'delta',
+      'resulting_quantity',
+      'reason',
+      'occurred_at',
+      'created_by',
+    ]);
+    if (!Array.isArray(records) || records.length === 0 || records.length > 10) {
+      return res.status(400).json({
+        error: 'Send between 1 and 10 inventory records per sync request.',
+      });
+    }
+    for (const record of records) {
+      if (!record || typeof record !== 'object' || Array.isArray(record) ||
+          Object.keys(record).some((key) => !allowedFields.has(key)) ||
+          typeof record.id !== 'string' || record.id.length === 0 ||
+          record.id.includes('/') ||
+          !['location', 'product', 'stock', 'movement'].includes(record.kind) ||
+          record.business_id !== req.businessId) {
+        return res.status(400).json({
+          error: 'An inventory record is invalid or belongs to another business.',
+        });
+      }
+      if (Buffer.byteLength(JSON.stringify(record), 'utf8') > 900 * 1024) {
+        return res.status(413).json({
+          error: 'An inventory record exceeds the 900 KB sync limit.',
+        });
+      }
+      const timeField = record.kind === 'movement' ? 'occurred_at' : 'updated_at';
+      if (typeof record[timeField] !== 'string' ||
+          !Number.isFinite(Date.parse(record[timeField]))) {
+        return res.status(400).json({
+          error: `An inventory record has an invalid ${timeField} value.`,
+        });
+      }
+    }
+
+    try {
+      await getDatabase().runTransaction(async (transaction) => {
+        const collection = getDatabase().collection('businesses')
+          .doc(req.businessId).collection('inventory');
+        const references = records.map((record) =>
+          collection.doc(`${record.kind}-${record.id}`));
+        const snapshots = await Promise.all(
+          references.map((reference) => transaction.get(reference)),
+        );
+        for (let index = 0; index < records.length; index += 1) {
+          const record = records[index];
+          const current = snapshots[index];
+          if (record.kind === 'movement' && current.exists) {
+            const existing = current.data();
+            const fields = [
+              'id',
+              'business_id',
+              'location_id',
+              'product_id',
+              'product_name',
+              'delta',
+              'resulting_quantity',
+              'reason',
+              'occurred_at',
+              'created_by',
+            ];
+            if (!fields.every((field) => existing[field] === record[field])) {
+              const error = new Error(
+                'An inventory movement already exists with different contents.',
+              );
+              error.status = 409;
+              throw error;
+            }
+            continue;
+          }
+          if (current.exists) {
+            const currentUpdatedAt = Date.parse(current.data().updated_at);
+            const incomingUpdatedAt = Date.parse(record.updated_at);
+            if (Number.isFinite(currentUpdatedAt) &&
+                currentUpdatedAt > incomingUpdatedAt) {
+              const error = new Error(
+                'Inventory changed on another device. Sync again before retrying.',
+              );
+              error.status = 409;
+              throw error;
+            }
+          }
+          transaction.set(references[index], record);
+        }
+      });
+      res.json({ uploaded: records.length });
+    } catch (error) {
+      if (error.status !== 409) {
+        console.error('Saving business inventory failed:', error);
+      }
+      res.status(error.status || 500).json({
+        error: error.status ? error.message : 'Unable to save the business inventory.',
+      });
+    }
+  });
+
+app.get('/api/business/transactions', requireAuth, requireBusinessMember,
   requirePaidAccess, requirePermission('viewReports'), async (req, res) => {
   try {
-    const snapshot = await getFirestore().collection('businesses').doc(req.businessId)
+    const snapshot = await getDatabase().collection('businesses').doc(req.businessId)
       .collection('transactions').orderBy('createdAt', 'desc').limit(250).get();
     res.json({
       transactions: snapshot.docs.map((doc) => {
@@ -3229,7 +3527,7 @@ app.get('/api/business/transactions', requireFirebaseAuth, requireBusinessMember
   }
 });
 
-app.post('/api/business/transactions/cash', requireFirebaseAuth, requireBusinessMember,
+app.post('/api/business/transactions/cash', requireAuth, requireBusinessMember,
   allowRoles('owner', 'cashier'), requirePermission('charge'), requirePaidAccess, async (req, res) => {
     try {
       const { service, vehicle, amount, currency = 'COP' } = req.body;
@@ -3239,7 +3537,7 @@ app.post('/api/business/transactions/cash', requireFirebaseAuth, requireBusiness
         return res.status(400).json({ error: 'A service and positive whole-COP amount are required.' });
       }
 
-      const ref = getFirestore().collection('businesses').doc(req.businessId)
+      const ref = getDatabase().collection('businesses').doc(req.businessId)
         .collection('transactions').doc();
       await ref.create({
         service: service.trim(),
@@ -3260,7 +3558,7 @@ app.post('/api/business/transactions/cash', requireFirebaseAuth, requireBusiness
     }
   });
 
-app.get('/api/business/providers', requireFirebaseAuth, requireBusinessMember,
+app.get('/api/business/providers', requireAuth, requireBusinessMember,
   requirePaidAccess, async (req, res) => {
   const providers = req.business.providers || {};
   let stripeStatus = providers.stripe?.status || 'not_connected';
@@ -3270,7 +3568,7 @@ app.get('/api/business/providers', requireFirebaseAuth, requireBusinessMember,
       stripeStatus = account.details_submitted && account.charges_enabled && account.payouts_enabled
         ? 'active'
         : 'onboarding';
-      await getFirestore().collection('businesses').doc(req.businessId).set({
+      await getDatabase().collection('businesses').doc(req.businessId).set({
         providers: {
           stripe: {
             status: stripeStatus,
@@ -3295,7 +3593,7 @@ app.get('/api/business/providers', requireFirebaseAuth, requireBusinessMember,
   });
 });
 
-app.put('/api/business/bank-transfer', requireFirebaseAuth, requireBusinessMember,
+app.put('/api/business/bank-transfer', requireAuth, requireBusinessMember,
   allowRoles('owner'), requirePaidAccess, async (req, res) => {
   const { bank, keyType, alias, accountHolder } = req.body;
   const banks = [
@@ -3329,7 +3627,7 @@ app.put('/api/business/bank-transfer', requireFirebaseAuth, requireBusinessMembe
     const previousBank = req.business.providers?.bankTransfer?.bank;
     const clearPreviousMerchantQr =
       previousBank && previousBank !== bank;
-    await getFirestore().collection('businesses').doc(req.businessId).set({
+    await getDatabase().collection('businesses').doc(req.businessId).set({
       providers: {
         bankTransfer: {
           bank,
@@ -3366,7 +3664,7 @@ const merchantQrImageBody = express.raw({
 
 app.put(
   '/api/business/bank-transfer/qr',
-  requireFirebaseAuth,
+  requireAuth,
   requireBusinessMember,
   allowRoles('owner'),
   requirePaidAccess,
@@ -3402,7 +3700,7 @@ app.put(
     }
 
     try {
-      await getFirestore()
+      await getDatabase()
         .collection('businesses')
         .doc(req.businessId)
         .update({
@@ -3423,13 +3721,13 @@ app.put(
 
 app.delete(
   '/api/business/bank-transfer/qr',
-  requireFirebaseAuth,
+  requireAuth,
   requireBusinessMember,
   allowRoles('owner'),
   requirePaidAccess,
   async (req, res) => {
     try {
-      await getFirestore()
+      await getDatabase()
         .collection('businesses')
         .doc(req.businessId)
         .update({
@@ -3449,13 +3747,13 @@ app.delete(
 
 app.get(
   '/api/business/providers/nequi/credentials',
-  requireFirebaseAuth,
+  requireAuth,
   requireBusinessMember,
   allowRoles('owner'),
   requirePaidAccess,
   async (req, res) => {
     try {
-      const config = await getFirestore()
+      const config = await getDatabase()
         .collection('businesses')
         .doc(req.businessId)
         .collection('privateIntegrations')
@@ -3478,7 +3776,7 @@ app.get(
 
 app.put(
   '/api/business/providers/nequi/credentials',
-  requireFirebaseAuth,
+  requireAuth,
   requireBusinessMember,
   allowRoles('owner'),
   requirePaidAccess,
@@ -3503,7 +3801,7 @@ app.put(
           apiKey: apiKey.trim(),
         }),
       );
-      await getFirestore()
+      await getDatabase()
         .collection('businesses')
         .doc(req.businessId)
         .collection('privateIntegrations')
@@ -3526,13 +3824,13 @@ app.put(
 
 app.delete(
   '/api/business/providers/nequi/credentials',
-  requireFirebaseAuth,
+  requireAuth,
   requireBusinessMember,
   allowRoles('owner'),
   requirePaidAccess,
   async (req, res) => {
     try {
-      await getFirestore()
+      await getDatabase()
         .collection('businesses')
         .doc(req.businessId)
         .collection('privateIntegrations')
@@ -3546,7 +3844,7 @@ app.delete(
   },
 );
 
-app.post('/api/business/bank-transfer/create', requireFirebaseAuth, requireBusinessMember,
+app.post('/api/business/bank-transfer/create', requireAuth, requireBusinessMember,
   allowRoles('owner', 'cashier'), requirePermission('charge'), requirePaidAccess,
   requirePaymentProviderReadiness('bank_transfer'), async (req, res) => {
     const { service, vehicle, amount } = req.body;
@@ -3560,7 +3858,7 @@ app.post('/api/business/bank-transfer/create', requireFirebaseAuth, requireBusin
     }
 
     try {
-      const ref = getFirestore().collection('businesses').doc(req.businessId)
+      const ref = getDatabase().collection('businesses').doc(req.businessId)
         .collection('transactions').doc();
       await ref.create({
         service: service.trim(),
@@ -3588,7 +3886,7 @@ app.post('/api/business/bank-transfer/create', requireFirebaseAuth, requireBusin
     }
   });
 
-app.post('/api/business/mercado-pago/create-payment', requireFirebaseAuth, requireBusinessMember,
+app.post('/api/business/mercado-pago/create-payment', requireAuth, requireBusinessMember,
   allowRoles('owner', 'cashier'), requirePermission('charge'), requirePaidAccess,
   requirePaymentProviderReadiness('mercado_pago'), async (req, res) => {
     const { service, vehicle, amount } = req.body;
@@ -3604,7 +3902,7 @@ app.post('/api/business/mercado-pago/create-payment', requireFirebaseAuth, requi
     let transactionRef;
     try {
       const token = await getMercadoPagoAccessToken(req.businessId, provider);
-      transactionRef = getFirestore().collection('businesses').doc(req.businessId)
+      transactionRef = getDatabase().collection('businesses').doc(req.businessId)
         .collection('transactions').doc();
       const reference = `${req.businessId}:${transactionRef.id}`;
       await transactionRef.create({
@@ -3668,15 +3966,15 @@ app.post('/api/business/mercado-pago/create-payment', requireFirebaseAuth, requi
   });
 
 app.post('/api/business/transactions/:transactionId/confirm-transfer',
-  requireFirebaseAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
+  requireAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
   requirePermission('charge'), requirePaidAccess, async (req, res) => {
     if (req.body.verifiedByVendor !== true) {
       return res.status(400).json({ error: 'Verify the deposit in the bank app before confirming.' });
     }
     try {
-      const ref = getFirestore().collection('businesses').doc(req.businessId)
+      const ref = getDatabase().collection('businesses').doc(req.businessId)
         .collection('transactions').doc(req.params.transactionId);
-      const result = await getFirestore().runTransaction(async (transaction) => {
+      const result = await getDatabase().runTransaction(async (transaction) => {
         const doc = await transaction.get(ref);
         if (!doc.exists || doc.data().provider !== 'bank_transfer') {
           const error = new Error('Bank transfer transaction not found.');
@@ -3702,7 +4000,7 @@ app.post('/api/business/transactions/:transactionId/confirm-transfer',
     }
   });
 
-app.post('/api/providers/mercadopago/connect', requireFirebaseAuth, requireBusinessMember,
+app.post('/api/providers/mercadopago/connect', requireAuth, requireBusinessMember,
   allowRoles('owner'), requirePaidAccess, async (req, res) => {
     const clientId = process.env.MERCADO_PAGO_CLIENT_ID;
     const redirectUri = process.env.MERCADO_PAGO_REDIRECT_URI;
@@ -3734,7 +4032,7 @@ app.get('/oauth/mercado-pago/callback', async (req, res) => {
     return res.status(400).send('Invalid or expired Mercado Pago connection request.');
   }
   try {
-    const membership = await getFirestore().collection('businesses').doc(state.businessId)
+    const membership = await getDatabase().collection('businesses').doc(state.businessId)
       .collection('members').doc(state.uid).get();
     if (!membership.exists || membership.data().active !== true || membership.data().role !== 'owner') {
       return res.status(403).send('The business owner authorization is no longer active.');
@@ -3755,7 +4053,7 @@ app.get('/oauth/mercado-pago/callback', async (req, res) => {
       console.error('Mercado Pago OAuth exchange failed:', tokenData.error || tokenResponse.status);
       return res.status(502).send('Mercado Pago could not connect this seller account.');
     }
-    await getFirestore().collection('businesses').doc(state.businessId).set({
+    await getDatabase().collection('businesses').doc(state.businessId).set({
       providers: {
         mercadoPago: {
           userId: String(tokenData.user_id),
@@ -3781,7 +4079,7 @@ app.get('/oauth/mercado-pago/callback', async (req, res) => {
 // ==========================================
 
 // Step 1: Create a new connected account using Stripe Accounts API
-app.post('/create-connected-account', requireFirebaseAuth, requireBusinessMember,
+app.post('/create-connected-account', requireAuth, requireBusinessMember,
   allowRoles('owner'), requirePaidAccess, async (req, res) => {
   try {
     requireStripe();
@@ -3804,7 +4102,7 @@ app.post('/create-connected-account', requireFirebaseAuth, requireBusinessMember
 
     const account = await stripe.accounts.create(accountParams);
 
-    await getFirestore().collection('businesses').doc(req.businessId).set({
+    await getDatabase().collection('businesses').doc(req.businessId).set({
       providers: {
         stripe: {
           accountId: account.id,
@@ -3821,7 +4119,7 @@ app.post('/create-connected-account', requireFirebaseAuth, requireBusinessMember
 });
 
 // Step 2: Generate a secure Stripe-hosted onboarding link
-app.post('/create-account-link', requireFirebaseAuth, requireBusinessMember,
+app.post('/create-account-link', requireAuth, requireBusinessMember,
   allowRoles('owner'), requirePaidAccess, async (req, res) => {
   try {
     requireStripe();
@@ -3852,7 +4150,7 @@ app.get('/onboarding-refresh', async (req, res) => {
     if (typeof accountId !== 'string' || !accountId.startsWith('acct_')) {
       return res.status(400).send('Invalid onboarding account.');
     }
-    const accounts = await getFirestore().collection('businesses')
+    const accounts = await getDatabase().collection('businesses')
       .where('providers.stripe.accountId', '==', accountId).limit(1).get();
     if (accounts.empty) {
       return res.status(404).send('Onboarding account not found.');
@@ -3931,7 +4229,7 @@ app.get('/success', (req, res) => {
 // ==========================================
 // 2. WOMPI PAYMENT ENDPOINT
 // ==========================================
-app.post('/api/transactions', requireFirebaseAuth, requireBusinessMember,
+app.post('/api/transactions', requireAuth, requireBusinessMember,
   requirePaidAccess, (req, res) => {
   res.status(503).json({
     error: 'Wompi seller onboarding and signed payment notifications are not configured for this business.',
@@ -3941,17 +4239,17 @@ app.post('/api/transactions', requireFirebaseAuth, requireBusinessMember,
 // ==========================================
 // 3. DEDICATED LOCAL PROVIDER ROUTES (Addi & Nequi)
 // ==========================================
-app.post('/api/local/addi/create-order', requireFirebaseAuth, requireBusinessMember,
+app.post('/api/local/addi/create-order', requireAuth, requireBusinessMember,
   requirePaidAccess, async (req, res) => {
   res.status(503).json({ success: false, error: 'Addi checkout credentials and payment confirmation webhooks are not configured.' });
 });
 
-app.post('/api/local/nequi/qr', requireFirebaseAuth, requireBusinessMember,
+app.post('/api/local/nequi/qr', requireAuth, requireBusinessMember,
   requirePaidAccess, async (req, res) => {
   res.status(503).json({ success: false, error: 'A Nequi-issued QR/payment request and verified callback are required.' });
 });
 
-app.post('/api/local/nequi/charge', requireFirebaseAuth, requireBusinessMember,
+app.post('/api/local/nequi/charge', requireAuth, requireBusinessMember,
   allowRoles('owner', 'cashier'), requirePaidAccess, async (req, res) => {
   const { phoneNumber, value } = req.body;
   if (
@@ -3974,7 +4272,7 @@ app.post('/api/local/nequi/charge', requireFirebaseAuth, requireBusinessMember,
 // ==========================================
 // 4. STRIPE TERMINAL & PAYMENT INTENTS
 // ==========================================
-app.post('/connectionToken', requireFirebaseAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
+app.post('/connectionToken', requireAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
   requirePermission('charge'), requirePaidAccess,
   requirePaymentProviderReadiness('stripe'), async (req, res) => {
     try {
@@ -3986,7 +4284,7 @@ app.post('/connectionToken', requireFirebaseAuth, requireBusinessMember, allowRo
     }
 });
 
-app.post('/connection-token', requireFirebaseAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
+app.post('/connection-token', requireAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
   requirePermission('charge'), requirePaidAccess,
   requirePaymentProviderReadiness('stripe'), async (req, res) => {
     try {
@@ -3998,7 +4296,7 @@ app.post('/connection-token', requireFirebaseAuth, requireBusinessMember, allowR
     }
 });
 
-app.post('/create-payment-intent', requireFirebaseAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
+app.post('/create-payment-intent', requireAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
   requirePermission('charge'), requirePaidAccess,
   requirePaymentProviderReadiness('stripe'), async (req, res) => {
     try {
@@ -4035,7 +4333,7 @@ app.post('/create-payment-intent', requireFirebaseAuth, requireBusinessMember, a
     }
 });
 
-app.post('/create-terminal-intent', requireFirebaseAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
+app.post('/create-terminal-intent', requireAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
   requirePermission('charge'), requirePaidAccess,
   requirePaymentProviderReadiness('stripe'), async (req, res) => {
   try {
@@ -4070,7 +4368,7 @@ app.post('/create-terminal-intent', requireFirebaseAuth, requireBusinessMember, 
   }
 });
 
-app.post('/create-checkout-session', requireFirebaseAuth, requireBusinessMember, allowRoles('owner'), async (req, res) => {
+app.post('/create-checkout-session', requireAuth, requireBusinessMember, allowRoles('owner'), async (req, res) => {
   try {
     requireStripe();
     const plans = {
@@ -4140,9 +4438,16 @@ app.use((error, req, res, next) => {
 
 if (require.main === module) {
   const PORT = process.env.PORT || 3000;
-  app.listen(PORT, () => {
-    console.log(`Backend server running on port ${PORT}`);
-  });
+  documentStore.initialize()
+    .then(() => {
+      app.listen(PORT, () => {
+        console.log(`Backend server running on port ${PORT}`);
+      });
+    })
+    .catch((error) => {
+      console.error('Backend database initialization failed:', error);
+      process.exitCode = 1;
+    });
 }
 
 module.exports = app;
