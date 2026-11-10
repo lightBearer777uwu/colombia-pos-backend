@@ -28,6 +28,15 @@ test('serves health and CORS preflight, and requires a session for the inbox', a
 
   const inbox = await fetch(`${origin}/api/business/conversations`);
   assert.equal(inbox.status, 401);
+  const campaigns = await fetch(`${origin}/api/business/marketing-campaigns`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ channel: 'email', text: 'Sale', subject: 'Sale' }),
+  });
+  assert.equal(campaigns.status, 401);
+
+  const channelStatus = await fetch(`${origin}/api/business/communications/status`);
+  assert.equal(channelStatus.status, 401);
 
   const previousSecret = process.env.REMINDER_JOB_SECRET;
   process.env.REMINDER_JOB_SECRET = 'test-reminder-job-secret-with-32-chars';

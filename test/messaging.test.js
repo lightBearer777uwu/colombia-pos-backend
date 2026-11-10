@@ -5,7 +5,7 @@ const test = require('node:test');
 const {
   isValidE164,
   isValidReplyAddress,
-  sendSendGridEmail,
+  sendSmtpEmail,
   sendTwilioMessage,
   validateMessage,
   verifyTwilioSignature,
@@ -30,7 +30,7 @@ test('verifies Twilio webhook signatures and rejects tampering', () => {
   assert.equal(verifyTwilioSignature(token, url, { ...params, Body: 'tampered' }, signature), false);
 });
 
-test('validates the opaque SendGrid reply address before routing email', () => {
+test('validates the opaque inbound-email reply address before routing', () => {
   assert.equal(isValidReplyAddress(`reply+${'a'.repeat(32)}@inbound.example.com`, 'inbound.example.com'), true);
   assert.equal(isValidReplyAddress('reply+bad@inbound.example.com', 'inbound.example.com'), false);
   assert.equal(isValidReplyAddress('attacker@example.com', 'inbound.example.com'), false);
@@ -77,23 +77,41 @@ test('uses the configured WhatsApp template for business-initiated messages', as
   assert.equal(form.has('Body'), false);
 });
 
-test('sends plain-text email through SendGrid', async () => {
-  let request;
-  const result = await sendSendGridEmail({
-    apiKey: 'secret',
+test('sends plain-text email over authenticated SMTP', async () => {
+  let transportOptions;
+  let message;
+  const result = await sendSmtpEmail({
+    host: 'smtp.example.com',
+    port: 587,
+    secure: false,
+    user: 'mailer@example.com',
+    password: 'smtp-test-password',
     fromEmail: 'shop@example.com',
+    fromName: 'Shop',
     to: 'customer@example.com',
     subject: 'Appointment',
     body: 'Confirmed',
     replyTo: `reply+${'a'.repeat(32)}@inbound.example.com`,
-    fetchImpl: async (url, options) => {
-      request = { url, options };
-      return { ok: true, headers: { get: () => 'SG123' } };
+    transportFactory: (options) => {
+      transportOptions = options;
+      return {
+        sendMail: async (value) => {
+          message = value;
+          return { messageId: '<message-123@example.com>' };
+        },
+      };
     },
   });
-  assert.equal(result.id, 'SG123');
-  assert.equal(request.url, 'https://api.sendgrid.com/v3/mail/send');
-  const payload = JSON.parse(request.options.body);
-  assert.equal(payload.content[0].type, 'text/plain');
-  assert.equal(payload.reply_to.email, `reply+${'a'.repeat(32)}@inbound.example.com`);
+  assert.equal(result.id, '<message-123@example.com>');
+  assert.equal(transportOptions.host, 'smtp.example.com');
+  assert.equal(transportOptions.port, 587);
+  assert.equal(transportOptions.requireTLS, true);
+  assert.deepEqual(transportOptions.auth, {
+    user: 'mailer@example.com',
+    pass: 'smtp-test-password',
+  });
+  assert.equal(message.from.address, 'shop@example.com');
+  assert.equal(message.from.name, 'Shop');
+  assert.equal(message.replyTo, `reply+${'a'.repeat(32)}@inbound.example.com`);
+  assert.equal(message.text, 'Confirmed');
 });

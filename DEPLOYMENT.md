@@ -41,7 +41,7 @@ flutter run -d windows --dart-define=BACKEND_BASE_URL=http://127.0.0.1:3000
 
 HTTP is accepted only for loopback development addresses. Deployed app builds
 must use the public HTTPS backend URL. Email verification and password-reset
-messages require configured SendGrid credentials and a verified sender.
+messages require an SMTP server account and a verified sender domain.
 
 ### Hosted service
 
@@ -96,7 +96,9 @@ Configure the following values in the backend Render service. Use secrets for cr
 - `PUBLIC_APP_URL` (public Flutter web origin) and `WEB_APP_ORIGINS` (comma-separated browser origins)
 - `TWILIO_ACCOUNT_SID` and `TWILIO_AUTH_TOKEN`
 - `TWILIO_WHATSAPP_CONTENT_SID` (approved one-variable WhatsApp utility template, required for business-initiated/out-of-window messages)
-- `SENDGRID_API_KEY`, `SENDGRID_FROM_EMAIL`, `SENDGRID_INBOUND_DOMAIN`, and `SENDGRID_INBOUND_WEBHOOK_SECRET`
+- `TWILIO_WHATSAPP_MARKETING_CONTENT_SID` (separate approved one-variable marketing template)
+- `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM_EMAIL`, and `SMTP_FROM_NAME`
+- `EMAIL_INBOUND_DOMAIN` and `EMAIL_INBOUND_WEBHOOK_SECRET` (for routed email replies)
 - `PRIVATE_AI_ENABLED` (keep `false` until your own HTTPS model is ready), `PRIVATE_AI_URL`, and `PRIVATE_AI_API_KEY`
 - `REMINDER_JOB_SECRET` (a random secret of at least 32 characters, shared only with the scheduled worker)
 
@@ -251,40 +253,50 @@ running multiple backend instances or exposing the endpoint to high traffic.
 When the paid-access launch switch is on, public availability and booking are
 also restricted to businesses with an active or trialing POS subscription.
 
-### Twilio and SendGrid setup
+### Twilio and SMTP setup
 
-Store Twilio and SendGrid credentials only in the backend environment, never
-in Flutter or client-readable database records. Each vendor must enter its
-unique Twilio SMS sender number and WhatsApp Business sender number in
-**Clientes → Preferencias**. These must be E.164 numbers provisioned in the
-configured Twilio account. Set the Twilio inbound messaging webhook to
+Store Twilio and SMTP credentials only in the backend environment, never in
+Flutter or client-readable database records. Email is sent by the app's own
+SMTP transport; a reachable mail server or SMTP relay, verified sender domain,
+and SPF/DKIM/DMARC records are still required for reliable delivery. Do not
+run a public mail server from the Flutter app or put SMTP credentials in a
+vendor device. Each vendor enters its business SMS sender number and WhatsApp
+Business sender number in **Clientes → Preferencias**. These must be E.164
+numbers provisioned in the configured Twilio account. Set the Twilio inbound messaging webhook to
 `https://<DOMAIN>/webhook/twilio/inbound` using POST; the backend validates
 `X-Twilio-Signature`, maps the receiving number to exactly one business, and
 accepts inbound text only from a customer with active channel consent. A
 customer's STOP/UNSUBSCRIBE keyword revokes that channel.
 For WhatsApp business-initiated messages, create and approve a Twilio Content
 template with one body variable and set its Content SID in
-`TWILIO_WHATSAPP_CONTENT_SID`; messages use the template variable `1`. Without
-it, Twilio can reject free-form messages outside an active customer-initiated
-conversation window.
+`TWILIO_WHATSAPP_CONTENT_SID`; service messages use variable `1`. Create a
+separate approved marketing template and set
+`TWILIO_WHATSAPP_MARKETING_CONTENT_SID` before launching WhatsApp campaigns.
+The app does not bypass WhatsApp's opt-in or template rules.
 
-Verify the SendGrid sender domain and configure Inbound Parse for
-`SENDGRID_INBOUND_DOMAIN`, including its required MX record. Set the parser's
-POST URL to
-`https://<DOMAIN>/webhook/sendgrid/inbound/<SENDGRID_INBOUND_WEBHOOK_SECRET>`.
-Use a unique random secret of at least 32 characters. Replies use opaque
+Set `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASSWORD`,
+`SMTP_FROM_EMAIL`, and `SMTP_FROM_NAME` to the mail server values. Use port 465
+with `SMTP_SECURE=true`, or a STARTTLS submission port such as 587 with
+`SMTP_SECURE=false`. Create an inbound email route on a domain you control and
+configure it to send multipart form fields `to`, `from`, and `text` to
+`https://<DOMAIN>/webhook/email/inbound/<EMAIL_INBOUND_WEBHOOK_SECRET>`.
+Configure the same domain as `EMAIL_INBOUND_DOMAIN` and use a unique webhook
+secret of at least 32 characters. Replies use opaque
 per-conversation `reply+<token>@<domain>` addresses and are accepted only from
 the opted-in customer's email. Messages are stored in the business-scoped
-inbox. Outbound messages are sent only to channels the customer opted into for
-service-related contact; marketing consent is separate and is not used for
-bulk campaigns. Failed provider sends are surfaced in the API and inbox.
+inbox. The campaign screen only targets customers who separately consented to
+marketing and the selected channel; the server checks consent again at send
+time. Bulk campaigns are processed in small batches, and delivery totals are
+available in the app. Failed provider sends are surfaced in the campaign
+status and inbox.
 
-The Flutter inbox supports business replies, inbound customer messages, and
-reviewable AI drafts. Provider delivery is unavailable until the provider
-accounts, sender numbers, verified domains, and webhook URLs above are
-configured. Twilio/SendGrid credentials are shared service credentials; do
-not promise message delivery until their account approval and webhook tests
-are complete.
+The Comunicaciones area contains the inbox, marketing campaigns, and channel
+setup. It also shows Instagram and TikTok direct publishing as unavailable
+until platform developer apps, approvals, and vendor account authorization
+flows are configured. Social passwords must never be collected by Tienda.
+Twilio/SMTP credentials are platform delivery credentials; vendor sender
+numbers must be provisioned with the configured provider. Do not promise
+delivery until provider account approval and webhook tests are complete.
 
 ### Private AI safeguards
 
@@ -319,4 +331,5 @@ repository root. Set its `REMINDER_JOB_URL` to
 `REMINDER_JOB_SECRET` to the same secret used by the backend web service. The
 worker exits unsuccessfully if the endpoint rejects the request. Scheduled
 provider delivery is unavailable until both services are deployed and the
-Twilio/SendGrid configuration above is complete.
+Twilio/SMTP configuration above is complete. The scheduled endpoint also
+recovers queued marketing campaigns after a backend restart.

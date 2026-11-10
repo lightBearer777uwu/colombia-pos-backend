@@ -1,6 +1,6 @@
 const crypto = require('node:crypto');
 const { promisify } = require('node:util');
-const { sendSendGridEmail } = require('./messaging');
+const { sendSmtpEmail } = require('./messaging');
 const { store } = require('./postgres-document-store');
 
 const scrypt = promisify(crypto.scrypt);
@@ -258,12 +258,13 @@ async function signIn(email, password) {
 }
 
 function emailConfiguration() {
-  const apiKey = process.env.SENDGRID_API_KEY;
-  const fromEmail = process.env.SENDGRID_FROM_EMAIL;
+  const host = process.env.SMTP_HOST;
+  const port = Number.parseInt(process.env.SMTP_PORT || '', 10);
+  const fromEmail = process.env.SMTP_FROM_EMAIL;
   const domain = process.env.DOMAIN;
-  if (!apiKey || !fromEmail || !domain) {
+  if (!host || !Number.isInteger(port) || !fromEmail || !domain) {
     throw authError(
-      'Account email is not configured on the server. Set SENDGRID_API_KEY, SENDGRID_FROM_EMAIL, and DOMAIN.',
+      'Account email is not configured on the server. Set SMTP_HOST, SMTP_PORT, SMTP_FROM_EMAIL, and DOMAIN.',
       503,
     );
   }
@@ -271,7 +272,16 @@ function emailConfiguration() {
   if (origin.protocol !== 'https:' || origin.username || origin.password) {
     throw authError('Account email links require a valid HTTPS DOMAIN.', 503);
   }
-  return { apiKey, fromEmail, domain: origin.origin };
+  return {
+    host,
+    port,
+    secure: process.env.SMTP_SECURE === 'true',
+    user: process.env.SMTP_USER || '',
+    password: process.env.SMTP_PASSWORD || '',
+    fromEmail,
+    fromName: process.env.SMTP_FROM_NAME || 'Tienda',
+    domain: origin.origin,
+  };
 }
 
 async function createEmailToken(userId, purpose) {
@@ -304,10 +314,14 @@ async function createEmailToken(userId, purpose) {
 
 async function sendAccountEmail({ to, subject, body }) {
   const config = emailConfiguration();
-  await sendSendGridEmail({
-    apiKey: config.apiKey,
+  await sendSmtpEmail({
+    host: config.host,
+    port: config.port,
+    secure: config.secure,
+    user: config.user,
+    password: config.password,
     fromEmail: config.fromEmail,
-    fromName: 'Tienda',
+    fromName: config.fromName,
     to,
     subject,
     body,

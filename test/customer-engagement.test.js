@@ -3,6 +3,7 @@ const test = require('node:test');
 
 const {
   getAppointmentSlotIds,
+  isMarketingEligible,
   isWithinBusinessHours,
   validateCustomerContact,
   validateCustomerEngagementSettings,
@@ -135,6 +136,22 @@ test('requires explicit service-message and separate marketing consent', () => {
     validateCustomerContact({ ...contact, marketingConsent: undefined }),
     /separately agreed/,
   );
+});
+
+test('marketing campaigns require active opt-in for the chosen channel', () => {
+  const contact = {
+    phone: '+573001234567',
+    email: 'customer@example.com',
+    channels: ['whatsapp', 'sms', 'email'],
+    serviceMessagesConsent: true,
+    marketingConsent: true,
+  };
+  assert.equal(isMarketingEligible(contact, 'whatsapp'), true);
+  assert.equal(isMarketingEligible(contact, 'sms'), true);
+  assert.equal(isMarketingEligible(contact, 'email'), true);
+  assert.equal(isMarketingEligible({ ...contact, marketingConsent: false }, 'sms'), false);
+  assert.equal(isMarketingEligible({ ...contact, channels: ['email'] }, 'whatsapp'), false);
+  assert.equal(isMarketingEligible({ ...contact, serviceMessagesConsent: false }, 'email'), false);
 });
 
 test('requires appointment duration to be covered by same-day configured hours', () => {

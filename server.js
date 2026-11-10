@@ -16,6 +16,7 @@ const {
 } = require('./paid-access-policy');
 const {
   getAppointmentSlotIds,
+  isMarketingEligible,
   isWithinBusinessHours,
   validateCustomerContact,
   validateCustomerEngagementSettings,
@@ -32,7 +33,7 @@ const {
 const {
   isValidE164,
   isValidReplyAddress,
-  sendSendGridEmail,
+  sendSmtpEmail,
   sendTwilioMessage,
   validateMessage,
   verifyTwilioSignature,
@@ -822,10 +823,10 @@ app.post('/webhook/twilio/inbound',
     }
   });
 
-app.post('/webhook/sendgrid/inbound/:secret',
+app.post('/webhook/email/inbound/:secret',
   express.raw({ type: 'multipart/form-data', limit: '1mb' }),
   async (req, res) => {
-    const expected = process.env.SENDGRID_INBOUND_WEBHOOK_SECRET || '';
+    const expected = process.env.EMAIL_INBOUND_WEBHOOK_SECRET || '';
     const actual = req.params.secret || '';
     const expectedBuffer = Buffer.from(expected);
     const actualBuffer = Buffer.from(actual);
@@ -849,7 +850,7 @@ app.post('/webhook/sendgrid/inbound/:secret',
         parser.on('close', resolve);
         parser.end(req.body);
       });
-      const domain = process.env.SENDGRID_INBOUND_DOMAIN || '';
+      const domain = process.env.EMAIL_INBOUND_DOMAIN || '';
       const recipients = String(fields.to || '').match(/[\w.+-]+@[\w.-]+/g) || [];
       const replyAddress = recipients.find((recipient) =>
         isValidReplyAddress(recipient, domain),
@@ -905,7 +906,7 @@ app.post('/webhook/sendgrid/inbound/:secret',
       });
       return res.status(200).send('Message received.');
     } catch (error) {
-      console.error('SendGrid inbound webhook failed:', error);
+      console.error('Inbound email webhook failed:', error);
       return res.status(500).send('Webhook processing failed.');
     }
   });
@@ -1687,6 +1688,8 @@ async function sendBusinessMessage({
   channel,
   text,
   senderUid,
+  marketing = false,
+  subject,
 }) {
   const validationError = validateMessage(text);
   if (validationError) {
@@ -1695,9 +1698,13 @@ async function sendBusinessMessage({
     throw error;
   }
   if (!['whatsapp', 'sms', 'email'].includes(channel) ||
-      customer.serviceMessagesConsent !== true ||
+      (marketing
+        ? customer.marketingConsent !== true
+        : customer.serviceMessagesConsent !== true) ||
       !(customer.channels || []).includes(channel)) {
-    const error = new Error('The customer has not consented to this service-message channel.');
+    const error = new Error(marketing
+      ? 'The customer has not consented to marketing messages on this channel.'
+      : 'The customer has not consented to this service-message channel.');
     error.status = 403;
     throw error;
   }
@@ -1730,6 +1737,7 @@ async function sendBusinessMessage({
     channel,
     direction: 'outbound',
     text: text.trim(),
+    messageType: marketing ? 'marketing' : 'service',
     status: 'sending',
     senderUid,
     createdAt: FieldValue.serverTimestamp(),
@@ -1739,17 +1747,22 @@ async function sendBusinessMessage({
   try {
     let delivery;
     if (channel === 'email') {
-      if (!process.env.SENDGRID_INBOUND_DOMAIN) {
-        throw new Error('SendGrid inbound reply domain is not configured.');
+      if (!process.env.EMAIL_INBOUND_DOMAIN) {
+        throw new Error('Inbound email reply domain is not configured.');
       }
-      delivery = await sendSendGridEmail({
-        apiKey: process.env.SENDGRID_API_KEY,
-        fromEmail: process.env.SENDGRID_FROM_EMAIL,
+      delivery = await sendSmtpEmail({
+        host: process.env.SMTP_HOST,
+        port: Number.parseInt(process.env.SMTP_PORT || '', 10),
+        secure: process.env.SMTP_SECURE === 'true',
+        user: process.env.SMTP_USER || '',
+        password: process.env.SMTP_PASSWORD || '',
+        fromEmail: process.env.SMTP_FROM_EMAIL,
         fromName: business.name || 'Tienda',
         to: target,
-        subject: `Mensaje de ${business.name || 'tu negocio'}`,
+        subject: subject?.trim() ||
+          `Mensaje de ${business.name || 'tu negocio'}`,
         body: text.trim(),
-        replyTo: `reply+${conversation.data().replyToken}@${process.env.SENDGRID_INBOUND_DOMAIN}`,
+        replyTo: `reply+${conversation.data().replyToken}@${process.env.EMAIL_INBOUND_DOMAIN}`,
       });
     } else {
       const from = channel === 'whatsapp'
@@ -1762,7 +1775,9 @@ async function sendBusinessMessage({
         to: target,
         body: text.trim(),
         channel,
-        whatsappContentSid: process.env.TWILIO_WHATSAPP_CONTENT_SID,
+        whatsappContentSid: marketing
+          ? process.env.TWILIO_WHATSAPP_MARKETING_CONTENT_SID
+          : process.env.TWILIO_WHATSAPP_CONTENT_SID,
       });
     }
     await messageRef.update({
@@ -1789,6 +1804,130 @@ async function sendBusinessMessage({
     });
     throw error;
   }
+}
+
+async function processMarketingCampaignBatch(db, businessId, campaignRef) {
+  const claimed = await db.runTransaction(async (transaction) => {
+    const snapshot = await transaction.get(campaignRef);
+    if (!snapshot.exists) return false;
+    const campaign = snapshot.data();
+    if (!['queued', 'sending'].includes(campaign.status)) return false;
+    const lease = campaign.workerLeaseUntil?.toDate?.();
+    if (lease && lease.getTime() > Date.now()) return false;
+    transaction.update(campaignRef, {
+      status: 'sending',
+      workerLeaseUntil: Timestamp.fromDate(new Date(Date.now() + 120_000)),
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+    return true;
+  });
+  if (!claimed) return { claimed: false, processed: 0 };
+
+  let processed = 0;
+  for (; processed < 3; processed += 1) {
+    const campaignSnapshot = await campaignRef.get();
+    if (!campaignSnapshot.exists) break;
+    const campaign = campaignSnapshot.data();
+    const index = campaign.nextRecipientIndex || 0;
+    const customerId = campaign.recipientIds[index];
+    if (!customerId) {
+      await campaignRef.update({
+        status: 'completed',
+        workerLeaseUntil: FieldValue.delete(),
+        completedAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      break;
+    }
+
+    let deliveryStatus = 'failed';
+    try {
+      const customerRef = db.collection('businesses').doc(businessId)
+        .collection('customers').doc(customerId);
+      const customerSnapshot = await customerRef.get();
+      if (!customerSnapshot.exists) {
+        throw new Error('Customer contact is no longer available.');
+      }
+      const delivery = await sendBusinessMessage({
+        db,
+        businessId,
+        customerId,
+        customer: customerSnapshot.data(),
+        channel: campaign.channel,
+        text: campaign.text,
+        subject: campaign.subject,
+        senderUid: campaign.createdBy,
+        marketing: true,
+      });
+      deliveryStatus = delivery.status || 'accepted';
+    } catch (error) {
+      console.error(`Marketing campaign ${campaignRef.id} delivery failed:`, error.message);
+    }
+
+    const results = Array.isArray(campaign.results) ? campaign.results : [];
+    await campaignRef.update({
+      nextRecipientIndex: index + 1,
+      sentCount: (campaign.sentCount || 0) +
+        (deliveryStatus === 'failed' ? 0 : 1),
+      failedCount: (campaign.failedCount || 0) +
+        (deliveryStatus === 'failed' ? 1 : 0),
+      results: [...results, { customerId, status: deliveryStatus }],
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+  }
+
+  const latest = await campaignRef.get();
+  if (latest.exists) {
+    const campaign = latest.data();
+    if ((campaign.nextRecipientIndex || 0) >= campaign.recipientIds.length) {
+      await campaignRef.update({
+        status: 'completed',
+        workerLeaseUntil: FieldValue.delete(),
+        completedAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+    } else {
+      await campaignRef.update({
+        status: 'queued',
+        workerLeaseUntil: FieldValue.delete(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+    }
+  }
+  return { claimed: true, processed };
+}
+
+async function processMarketingCampaign(db, businessId, campaignRef) {
+  let totalProcessed = 0;
+  while (totalProcessed < 200) {
+    const result = await processMarketingCampaignBatch(db, businessId, campaignRef);
+    if (!result.claimed || result.processed === 0) break;
+    totalProcessed += result.processed;
+  }
+  return totalProcessed;
+}
+
+async function processPendingMarketingCampaigns(db) {
+  const businesses = await db.collection('businesses').limit(500).get();
+  let campaignsProcessed = 0;
+  let recipientsProcessed = 0;
+  for (const business of businesses.docs) {
+    if (campaignsProcessed >= 20) break;
+    const campaigns = await business.ref.collection('marketingCampaigns')
+      .limit(50).get();
+    for (const campaign of campaigns.docs) {
+      if (!['queued', 'sending'].includes(campaign.data().status)) continue;
+      campaignsProcessed += 1;
+      const batch = await processMarketingCampaignBatch(
+        db,
+        business.id,
+        campaign.ref,
+      );
+      recipientsProcessed += batch.processed;
+      if (campaignsProcessed >= 20) break;
+    }
+  }
+  return { campaignsProcessed, recipientsProcessed };
 }
 
 async function notifyAppointmentCustomer(db, businessId, appointment) {
@@ -1843,8 +1982,9 @@ function getAppointmentReminderChannel(customer, settings) {
       process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
     return 'sms';
   }
-  if (channels.includes('email') && process.env.SENDGRID_API_KEY &&
-      process.env.SENDGRID_FROM_EMAIL && process.env.SENDGRID_INBOUND_DOMAIN) {
+  if (channels.includes('email') && process.env.SMTP_HOST &&
+      process.env.SMTP_PORT && process.env.SMTP_FROM_EMAIL &&
+      process.env.EMAIL_INBOUND_DOMAIN) {
     return 'email';
   }
   return null;
@@ -2028,10 +2168,15 @@ app.post('/api/internal/appointment-reminders', async (req, res) => {
     return res.status(401).json({ error: 'Unauthorized reminder job.' });
   }
   try {
-    res.json(await processDueAppointmentReminders(getDatabase()));
+    const db = getDatabase();
+    const [reminders, marketingCampaigns] = await Promise.all([
+      processDueAppointmentReminders(db),
+      processPendingMarketingCampaigns(db),
+    ]);
+    res.json({ reminders, marketingCampaigns });
   } catch (error) {
-    console.error('Scheduled appointment reminders could not be processed:', error);
-    res.status(500).json({ error: 'Unable to process scheduled appointment reminders.' });
+    console.error('Scheduled business messages could not be processed:', error);
+    res.status(500).json({ error: 'Unable to process scheduled business messages.' });
   }
 });
 
@@ -2787,6 +2932,41 @@ app.get('/api/business/conversations',
     }
   });
 
+app.get('/api/business/communications/status',
+  requireAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
+  requirePermission('charge'), requirePaidAccess, (req, res) => {
+    const settings = getCustomerEngagementSettings(req.business);
+    res.json({
+      channels: {
+        sms: {
+          deliveryConfigured: Boolean(
+            process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN,
+          ),
+          senderConfigured: Boolean(settings.smsNumber),
+        },
+        whatsapp: {
+          deliveryConfigured: Boolean(
+            process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN,
+          ),
+          senderConfigured: Boolean(settings.whatsappNumber),
+          marketingTemplateConfigured: Boolean(
+            process.env.TWILIO_WHATSAPP_MARKETING_CONTENT_SID,
+          ),
+        },
+        email: {
+          deliveryConfigured: Boolean(
+            process.env.SMTP_HOST && process.env.SMTP_PORT &&
+            process.env.SMTP_FROM_EMAIL,
+          ),
+          inboundConfigured: Boolean(
+            process.env.EMAIL_INBOUND_DOMAIN &&
+            process.env.EMAIL_INBOUND_WEBHOOK_SECRET,
+          ),
+        },
+      },
+    });
+  });
+
 app.get('/api/business/conversations/:conversationId/messages',
   requireAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
   requirePermission('charge'), requirePaidAccess, async (req, res) => {
@@ -2852,6 +3032,131 @@ app.post('/api/business/conversations',
       console.error('Business message could not be sent:', error.message);
       res.status(error.status || 502).json({
         error: error.status ? error.message : 'Message delivery failed; review its status in the inbox.',
+      });
+    }
+  });
+
+app.post('/api/business/marketing-campaigns',
+  requireAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
+  requirePermission('charge'), requirePaidAccess, async (req, res) => {
+    const { channel, text } = req.body;
+    const subject = typeof req.body.subject === 'string'
+      ? req.body.subject.trim()
+      : '';
+    const validationError = validateMessage(text);
+    if (!['whatsapp', 'sms', 'email'].includes(channel)) {
+      return res.status(400).json({ error: 'Choose WhatsApp, SMS, or email.' });
+    }
+    if (validationError) return res.status(400).json({ error: validationError });
+    if (channel === 'email' && (subject.length < 2 || subject.length > 150)) {
+      return res.status(400).json({ error: 'Email campaigns need a subject of 2 to 150 characters.' });
+    }
+
+    try {
+      const db = getDatabase();
+      const businessRef = db.collection('businesses').doc(req.businessId);
+      const settings = getCustomerEngagementSettings(req.business);
+      if (channel === 'email' &&
+          (!process.env.SMTP_HOST || !process.env.SMTP_PORT ||
+           !process.env.SMTP_FROM_EMAIL || !process.env.EMAIL_INBOUND_DOMAIN)) {
+        return res.status(503).json({ error: 'Business email delivery is not configured.' });
+      }
+      if (channel === 'sms' &&
+          (!settings.smsNumber || !process.env.TWILIO_ACCOUNT_SID ||
+           !process.env.TWILIO_AUTH_TOKEN)) {
+        return res.status(503).json({ error: 'Set up the business SMS number and delivery account first.' });
+      }
+      if (channel === 'whatsapp' &&
+          (!settings.whatsappNumber || !process.env.TWILIO_ACCOUNT_SID ||
+           !process.env.TWILIO_AUTH_TOKEN ||
+           !process.env.TWILIO_WHATSAPP_MARKETING_CONTENT_SID)) {
+        return res.status(503).json({
+          error: 'Set up the WhatsApp Business sender and its approved marketing template first.',
+        });
+      }
+
+      const customers = await businessRef.collection('customers').limit(200).get();
+      const recipients = customers.docs
+        .filter((customer) => {
+          const data = customer.data();
+          return isMarketingEligible(data, channel);
+        })
+        .map((customer) => customer.id);
+      if (!recipients.length) {
+        return res.status(409).json({
+          error: 'No customers have opted in to marketing on this channel.',
+        });
+      }
+
+      const now = new Date();
+      const campaign = {
+        channel,
+        subject,
+        text: text.trim(),
+        recipientIds: recipients,
+        nextRecipientIndex: 0,
+        sentCount: 0,
+        failedCount: 0,
+        results: [],
+        status: 'queued',
+        createdBy: req.authUser.uid,
+        createdAt: Timestamp.fromDate(now),
+        updatedAt: Timestamp.fromDate(now),
+      };
+      const reference = await businessRef.collection('marketingCampaigns')
+        .add(campaign);
+      setImmediate(() => {
+        processMarketingCampaign(db, req.businessId, reference)
+          .catch((error) => console.error(
+            `Marketing campaign ${reference.id} could not be processed:`,
+            error,
+          ));
+      });
+      res.status(202).json({
+        campaign: {
+          id: reference.id,
+          status: campaign.status,
+          channel,
+          recipientCount: recipients.length,
+          sentCount: 0,
+          failedCount: 0,
+        },
+      });
+    } catch (error) {
+      console.error('Marketing campaign could not be created:', error);
+      res.status(error.status || 500).json({
+        error: 'Unable to create the marketing campaign.',
+      });
+    }
+  });
+
+app.get('/api/business/marketing-campaigns/:campaignId',
+  requireAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
+  requirePermission('charge'), requirePaidAccess, async (req, res) => {
+    try {
+      const campaign = await getDatabase().collection('businesses')
+        .doc(req.businessId).collection('marketingCampaigns')
+        .doc(req.params.campaignId).get();
+      if (!campaign.exists) {
+        return res.status(404).json({ error: 'Marketing campaign not found.' });
+      }
+      const data = campaign.data();
+      res.json({
+        campaign: {
+          id: campaign.id,
+          channel: data.channel,
+          status: data.status,
+          recipientCount: data.recipientIds.length,
+          sentCount: data.sentCount || 0,
+          failedCount: data.failedCount || 0,
+          createdAt: data.createdAt?.toDate?.().toISOString() || '',
+          completedAt: data.completedAt?.toDate?.().toISOString() || '',
+        },
+      });
+    } catch (error) {
+      console.error('Marketing campaign status could not be loaded:', error);
+      res.status(error.status || 500).json({
+        error: 'Unable to load the marketing campaign status.',
       });
     }
   });

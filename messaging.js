@@ -1,4 +1,5 @@
 const crypto = require('crypto');
+const nodemailer = require('nodemailer');
 
 const CHANNELS = new Set(['whatsapp', 'sms', 'email']);
 
@@ -81,39 +82,44 @@ async function sendTwilioMessage({
   return { id: result.sid || '', status: result.status || 'queued' };
 }
 
-async function sendSendGridEmail({
-  apiKey,
+async function sendSmtpEmail({
+  host,
+  port,
+  secure,
+  user,
+  password,
   fromEmail,
   fromName,
   to,
   subject,
   body,
   replyTo,
-  fetchImpl = fetch,
+  transportFactory = nodemailer.createTransport,
 }) {
-  if (!apiKey || !fromEmail) {
-    throw new Error('SendGrid sender configuration is incomplete.');
+  if (!host || !Number.isInteger(port) || port < 1 || port > 65535 ||
+      typeof secure !== 'boolean' || !fromEmail) {
+    throw new Error('SMTP sender configuration is incomplete.');
   }
-  const response = await fetchImpl('https://api.sendgrid.com/v3/mail/send', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      personalizations: [{ to: [{ email: to }] }],
-      from: { email: fromEmail, ...(fromName ? { name: fromName } : {}) },
-      reply_to: replyTo ? { email: replyTo } : undefined,
-      subject,
-      content: [{ type: 'text/plain', value: body }],
-    }),
-    signal: AbortSignal.timeout(10000),
+  const transporter = transportFactory({
+    host,
+    port,
+    secure,
+    requireTLS: !secure,
+    connectionTimeout: 10000,
+    greetingTimeout: 10000,
+    socketTimeout: 20000,
+    tls: { rejectUnauthorized: true },
+    ...(user ? { auth: { user, pass: password || '' } } : {}),
   });
-  if (!response.ok) {
-    throw new Error(`SendGrid message delivery failed (${response.status}).`);
-  }
+  const result = await transporter.sendMail({
+    from: { address: fromEmail, ...(fromName ? { name: fromName } : {}) },
+    to,
+    ...(replyTo ? { replyTo } : {}),
+    subject,
+    text: body,
+  });
   return {
-    id: response.headers.get('x-message-id') || '',
+    id: result.messageId || '',
     status: 'accepted',
   };
 }
@@ -121,7 +127,7 @@ async function sendSendGridEmail({
 module.exports = {
   isValidE164,
   isValidReplyAddress,
-  sendSendGridEmail,
+  sendSmtpEmail,
   sendTwilioMessage,
   validateMessage,
   verifyTwilioSignature,

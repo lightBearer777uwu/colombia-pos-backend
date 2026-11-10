@@ -143,6 +143,20 @@ function validateCustomerContact(contact) {
   return null;
 }
 
+function isMarketingEligible(contact, channel) {
+  if (!contact || contact.marketingConsent !== true ||
+      contact.serviceMessagesConsent !== true ||
+      !CHANNELS.has(channel) || !Array.isArray(contact.channels) ||
+      !contact.channels.includes(channel)) {
+    return false;
+  }
+  return channel === 'email'
+    ? typeof contact.email === 'string' &&
+        /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(contact.email)
+    : typeof contact.phone === 'string' &&
+        /^\+[1-9]\d{7,14}$/.test(contact.phone);
+}
+
 function getLocalDateParts(date, timeZone) {
   const parts = new Intl.DateTimeFormat('en-US', {
     timeZone,
@@ -182,6 +196,7 @@ function getAppointmentSlotIds(start, durationMinutes) {
 module.exports = {
   CHANNELS,
   getAppointmentSlotIds,
+  isMarketingEligible,
   isWithinBusinessHours,
   validateCustomerContact,
   validateCustomerEngagementSettings,
