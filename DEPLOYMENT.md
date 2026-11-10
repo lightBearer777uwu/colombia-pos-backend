@@ -48,6 +48,11 @@ Configure the following values in the backend Render service. Use secrets for cr
 - `PROVIDER_TOKEN_ENCRYPTION_KEY`: base64 encoding of exactly 32 random bytes
 - `OAUTH_STATE_SECRET`: a random secret of at least 32 characters
 - `MERCADO_PAGO_CLIENT_ID`, `MERCADO_PAGO_CLIENT_SECRET`, `MERCADO_PAGO_REDIRECT_URI`, and `MERCADO_PAGO_WEBHOOK_SECRET`
+- `PUBLIC_APP_URL` (public Flutter web origin) and `WEB_APP_ORIGINS` (comma-separated browser origins)
+- `TWILIO_ACCOUNT_SID` and `TWILIO_AUTH_TOKEN`
+- `TWILIO_WHATSAPP_CONTENT_SID` (approved one-variable WhatsApp utility template, required for business-initiated/out-of-window messages)
+- `SENDGRID_API_KEY`, `SENDGRID_FROM_EMAIL`, `SENDGRID_INBOUND_DOMAIN`, and `SENDGRID_INBOUND_WEBHOOK_SECRET`
+- `PRIVATE_AI_ENABLED` (keep `false` until your own HTTPS model is ready), `PRIVATE_AI_URL`, and `PRIVATE_AI_API_KEY`
 
 The app presents these monthly plan choices, with the displayed amount taken
 from the corresponding Stripe Price (the label in Flutter is informational):
@@ -114,3 +119,118 @@ The legacy owner-only `POST /api/business/members` endpoint remains available
 for verified existing accounts. New staff setup should use the invitation-code
 flow so the employee can join from the app without an administrator manually
 adding an already-registered UID.
+
+## Paid-access enforcement (leave off during development)
+
+The single global paid-access launch switch is intentionally off during
+development. It is not a vendor opt-in: after the owner enables it for launch,
+every vendor must have an active or trialing subscription to use paid POS
+features, with no vendor-facing bypass.
+
+Enforcement remains disabled unless the Firebase Admin-controlled
+Firestore document `platformSettings/accessControl` exists with the boolean
+field `paidAccessEnforcementEnabled` set to `true`. A missing document, a
+missing field, or any value other than boolean `true` keeps the backend checks
+off. **Do not create or enable this setting until the POS SaaS is ready for
+vendors.** The app's Firebase client is explicitly denied access to this
+control document; change it only through a trusted Firebase/administrative
+channel.
+
+When enabled, the server allows paid POS operations only when the business
+subscription status is `active` or `trialing`. It protects sales and payment
+creation, transaction history and transfer confirmation, provider setup, team
+operations, and the Firestore inventory mirror. Member revocation remains
+available for account security. Unpaid requests receive HTTP 402 with code
+`subscription_required`. Business bootstrap/profile, business and subscription
+status, payment readiness, and subscription checkout remain available so
+vendors can register and purchase access. Subscription state continues to be
+updated by verified Stripe webhooks; a checkout redirect is not proof of
+payment. Firestore rules also prevent clients from creating or changing
+server-managed subscription and payment-provider fields.
+
+At launch, deploy the backend and Firestore rules, then set the exact boolean
+field above to `true` in the production Firebase project. To turn enforcement
+back off, set it to `false` or remove the control document. Test the switch in
+a staging Firebase project first. This toggle does not enforce per-plan staff,
+location, or feature limits; those require separate entitlement rules.
+
+## Customer contacts and appointments
+
+The app's **Clientes** area stores business-scoped customer contacts only
+after a vendor records the customer's explicit choice of service-related
+message channels. Marketing permission is separate and unchecked by default.
+The vendor can revoke a channel, service-message consent, marketing consent,
+or optional private-AI consent.
+Direct Firestore client access to customer and appointment records is denied;
+the authenticated backend checks business membership and the paid-access
+launch switch.
+
+Business owners configure their timezone, weekly hours, appointment services,
+durations, and whether a booking needs vendor approval or may be confirmed
+automatically. Appointments reserve 15-minute slots in a Firestore transaction
+so simultaneous requests cannot double-book the same business. Auto-confirm
+uses only vendor-configured hours and enabled services. To publish a customer
+booking page, enable online bookings, set a unique 3-50 character lowercase
+slug, and enable the public booking page in **Clientes**. Configure
+`PUBLIC_APP_URL` to the Flutter web deployment and `WEB_APP_ORIGINS` to its
+HTTPS origin. The public page is `/book/<slug>`; hosting must serve the Flutter
+single-page app for that path. Public endpoints are:
+
+- `GET /api/public/businesses/:slug` — public business name and enabled services
+- `GET /api/public/businesses/:slug/availability?serviceId=...&date=YYYY-MM-DD`
+- `POST /api/public/businesses/:slug/book` — validates opt-in, rechecks business
+  settings and uses a Firestore transaction to reserve the selected slots
+
+The public API rate-limits requests per client IP and includes a booking
+honeypot. The limiter is in-memory; use a shared rate-limit store before
+running multiple backend instances or exposing the endpoint to high traffic.
+When the paid-access launch switch is on, public availability and booking are
+also restricted to businesses with an active or trialing POS subscription.
+
+### Twilio and SendGrid setup
+
+Store Twilio and SendGrid credentials only in the backend environment, never
+in Flutter or Firestore client-readable documents. Each vendor must enter its
+unique Twilio SMS sender number and WhatsApp Business sender number in
+**Clientes → Preferencias**. These must be E.164 numbers provisioned in the
+configured Twilio account. Set the Twilio inbound messaging webhook to
+`https://<DOMAIN>/webhook/twilio/inbound` using POST; the backend validates
+`X-Twilio-Signature`, maps the receiving number to exactly one business, and
+accepts inbound text only from a customer with active channel consent. A
+customer's STOP/UNSUBSCRIBE keyword revokes that channel.
+For WhatsApp business-initiated messages, create and approve a Twilio Content
+template with one body variable and set its Content SID in
+`TWILIO_WHATSAPP_CONTENT_SID`; messages use the template variable `1`. Without
+it, Twilio can reject free-form messages outside an active customer-initiated
+conversation window.
+
+Verify the SendGrid sender domain and configure Inbound Parse for
+`SENDGRID_INBOUND_DOMAIN`, including its required MX record. Set the parser's
+POST URL to
+`https://<DOMAIN>/webhook/sendgrid/inbound/<SENDGRID_INBOUND_WEBHOOK_SECRET>`.
+Use a unique random secret of at least 32 characters. Replies use opaque
+per-conversation `reply+<token>@<domain>` addresses and are accepted only from
+the opted-in customer's email. Messages are stored in the business-scoped
+inbox. Outbound messages are sent only to channels the customer opted into for
+service-related contact; marketing consent is separate and is not used for
+bulk campaigns. Failed provider sends are surfaced in the API and inbox.
+
+The Flutter inbox supports business replies, inbound customer messages, and
+reviewable AI drafts. Provider delivery is unavailable until the provider
+accounts, sender numbers, verified domains, and webhook URLs above are
+configured. Twilio/SendGrid credentials are shared service credentials; do
+not promise message delivery until their account approval and webhook tests
+are complete.
+
+### Private AI safeguards
+
+Keep `PRIVATE_AI_ENABLED` unset or `false` until the private model's HTTPS API
+is ready. The connector sends only the recent conversation text, channel, and
+business name to `PRIVATE_AI_URL`; it excludes customer phone and email. The
+customer must separately opt in to AI-assisted drafting, and the business
+owner must enable drafts in **Clientes → Preferencias**. Replies are saved as
+drafts for a vendor to review and send; the model cannot send messages or take
+actions. The endpoint must accept a JSON request with `task`,
+`businessName`, `channel`, and `messages`, and return JSON with a `reply`
+string. Do not point this setting at a third-party model. Inventory and live
+stock/pricing lookups are not part of this initial AI connector.
