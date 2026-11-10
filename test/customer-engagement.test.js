@@ -97,6 +97,22 @@ test('validates vendor-controlled booking settings', () => {
   );
 });
 
+test('validates customer appointment reminder preferences', () => {
+  assert.equal(validateCustomerEngagementSettings({
+    ...defaultSettings,
+    customerReminderEnabled: true,
+    customerReminderMinutesBefore: 120,
+  }), null);
+  assert.match(validateCustomerEngagementSettings({
+    ...defaultSettings,
+    customerReminderEnabled: 'yes',
+  }), /automatic customer appointment reminders/);
+  assert.match(validateCustomerEngagementSettings({
+    ...defaultSettings,
+    customerReminderMinutesBefore: 10,
+  }), /supported customer reminder/);
+});
+
 test('requires explicit service-message and separate marketing consent', () => {
   const contact = {
     name: 'Customer',

@@ -1,5 +1,15 @@
 # Secure payment setup
 
+## Combined app and backend repository
+
+The Flutter app is in the repository root and the backend is in `backend/`.
+When deploying this backend from the combined GitHub repository, configure
+Render's root directory as `backend`, with `npm install` as the build command
+and `npm start` as the start command. Keep backend environment variables and
+credentials in the Render service, never in the app or repository. Existing
+deployments connected to the standalone backend repository may continue using
+that repository.
+
 ## Firebase
 
 1. The app has no general vendor sign-in or app-wide device-lock screen. It reuses an existing Firebase session if present; otherwise, it creates a Firebase Anonymous session in the background to authenticate backend requests. Enable **Anonymous** in Firebase Authentication for new app installations. Anonymous business identity is tied to that app installation and can be lost after app data is cleared or the device is replaced. Do not make protected endpoints public to work around this limitation. The Finance bank/provider setup area has a separate optional local OS-auth gate (Face ID, fingerprint, or device PIN); it does not replace backend authorization.
@@ -53,6 +63,7 @@ Configure the following values in the backend Render service. Use secrets for cr
 - `TWILIO_WHATSAPP_CONTENT_SID` (approved one-variable WhatsApp utility template, required for business-initiated/out-of-window messages)
 - `SENDGRID_API_KEY`, `SENDGRID_FROM_EMAIL`, `SENDGRID_INBOUND_DOMAIN`, and `SENDGRID_INBOUND_WEBHOOK_SECRET`
 - `PRIVATE_AI_ENABLED` (keep `false` until your own HTTPS model is ready), `PRIVATE_AI_URL`, and `PRIVATE_AI_API_KEY`
+- `REMINDER_JOB_SECRET` (a random secret of at least 32 characters, shared only with the scheduled worker)
 
 The app presents these monthly plan choices, with the displayed amount taken
 from the corresponding Stripe Price (the label in Flutter is informational):
@@ -234,3 +245,25 @@ actions. The endpoint must accept a JSON request with `task`,
 `businessName`, `channel`, and `messages`, and return JSON with a `reply`
 string. Do not point this setting at a third-party model. Inventory and live
 stock/pricing lookups are not part of this initial AI connector.
+
+### Appointment reminders
+
+Vendors may save private in-app reminders in **Agenda**. These stay attached to
+the business and appear in the calendar when a vendor opens the app; the app
+does not yet deliver operating-system push notifications while closed.
+
+Optional customer appointment reminders can be enabled in
+**Clientes → Preferencias** (30 minutes, 2 hours, or 24 hours before the
+appointment). They are queued only for confirmed appointments, and delivery
+rechecks the appointment status, the business preference, the customer's
+current service-message consent, and their selected channels. Failed provider
+deliveries retry up to three times. Configure a Render Cron Job using the same
+source repository as the backend web service, command `npm run reminders`, and
+a five-minute schedule. For the combined app repository, set the cron job's
+root directory to `backend`; for the standalone backend repository, use the
+repository root. Set its `REMINDER_JOB_URL` to
+`https://<DOMAIN>/api/internal/appointment-reminders` and set
+`REMINDER_JOB_SECRET` to the same secret used by the backend web service. The
+worker exits unsuccessfully if the endpoint rejects the request. Scheduled
+provider delivery is unavailable until both services are deployed and the
+Twilio/SendGrid configuration above is complete.

@@ -28,4 +28,19 @@ test('serves health, CORS preflight, and keeps inbox behind Firebase auth', asyn
 
   const inbox = await fetch(`${origin}/api/business/conversations`);
   assert.equal(inbox.status, 401);
+
+  const previousSecret = process.env.REMINDER_JOB_SECRET;
+  process.env.REMINDER_JOB_SECRET = 'test-reminder-job-secret-with-32-chars';
+  context.after(() => {
+    if (previousSecret === undefined) {
+      delete process.env.REMINDER_JOB_SECRET;
+    } else {
+      process.env.REMINDER_JOB_SECRET = previousSecret;
+    }
+  });
+  const unauthorizedJob = await fetch(
+    `${origin}/api/internal/appointment-reminders`,
+    { method: 'POST', headers: { Authorization: 'Bearer invalid' } },
+  );
+  assert.equal(unauthorizedJob.status, 401);
 });

@@ -3,7 +3,11 @@ const Busboy = require('busboy');
 const app = express();
 const { cert, initializeApp } = require('firebase-admin/app');
 const { getAuth } = require('firebase-admin/auth');
-const { FieldValue, getFirestore: getAdminFirestore } = require('firebase-admin/firestore');
+const {
+  FieldValue,
+  Timestamp,
+  getFirestore: getAdminFirestore,
+} = require('firebase-admin/firestore');
 const crypto = require('crypto');
 const {
   hasActivePosSubscription,
@@ -15,6 +19,10 @@ const {
   validateCustomerContact,
   validateCustomerEngagementSettings,
 } = require('./customer-engagement');
+const {
+  getCustomerReminderAt,
+  validateVendorReminder,
+} = require('./reminder-policy');
 const {
   getPublicAppointmentSlots,
   isValidPublicBookingSlug,
@@ -1306,6 +1314,8 @@ function getCustomerEngagementSettings(business) {
     bookingMode: 'manual_approval',
     publicBookingEnabled: false,
     publicBookingSlug: '',
+    customerReminderEnabled: false,
+    customerReminderMinutesBefore: 1440,
     weeklyHours: {
       sun: [],
       mon: [],
@@ -1320,6 +1330,36 @@ function getCustomerEngagementSettings(business) {
     whatsappNumber: '',
     aiEnabled: false,
   };
+}
+
+function getAppointmentReminderRef(db, businessId, appointmentId) {
+  return db.collection('scheduledAppointmentReminders')
+    .doc(`${businessId}_${appointmentId}`);
+}
+
+function enqueueCustomerAppointmentReminder(transaction, {
+  db,
+  businessId,
+  appointmentId,
+  startAt,
+  settings,
+}) {
+  if (settings.customerReminderEnabled !== true) return null;
+  const reminderAt = getCustomerReminderAt(
+    startAt,
+    settings.customerReminderMinutesBefore,
+  );
+  if (!reminderAt) return null;
+  transaction.set(getAppointmentReminderRef(db, businessId, appointmentId), {
+    businessId,
+    appointmentId,
+    remindAt: Timestamp.fromDate(reminderAt),
+    state: 'scheduled',
+    attemptCount: 0,
+    createdAt: FieldValue.serverTimestamp(),
+    updatedAt: FieldValue.serverTimestamp(),
+  });
+  return Timestamp.fromDate(reminderAt);
 }
 
 app.get('/api/business/customer-engagement/settings',
@@ -1350,6 +1390,8 @@ app.put('/api/business/customer-engagement/settings',
       bookingMode: req.body.bookingMode,
       publicBookingEnabled: req.body.publicBookingEnabled === true,
       publicBookingSlug: req.body.publicBookingSlug || '',
+      customerReminderEnabled: req.body.customerReminderEnabled === true,
+      customerReminderMinutesBefore: req.body.customerReminderMinutesBefore ?? 1440,
       weeklyHours: req.body.weeklyHours,
       smsNumber: req.body.smsNumber || '',
       whatsappNumber: req.body.whatsappNumber || '',
@@ -1621,6 +1663,208 @@ async function notifyAppointmentCustomer(db, businessId, appointment) {
   }
 }
 
+function getAppointmentReminderChannel(customer, settings) {
+  const channels = customer.channels || [];
+  if (channels.includes('whatsapp') && settings.whatsappNumber &&
+      process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
+    return 'whatsapp';
+  }
+  if (channels.includes('sms') && settings.smsNumber &&
+      process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
+    return 'sms';
+  }
+  if (channels.includes('email') && process.env.SENDGRID_API_KEY &&
+      process.env.SENDGRID_FROM_EMAIL && process.env.SENDGRID_INBOUND_DOMAIN) {
+    return 'email';
+  }
+  return null;
+}
+
+async function processDueAppointmentReminders(db, now = new Date()) {
+  const reminders = await db.collection('scheduledAppointmentReminders')
+    .where('remindAt', '<=', Timestamp.fromDate(now))
+    .orderBy('remindAt', 'asc')
+    .limit(50)
+    .get();
+  if (reminders.empty) return { processed: 0, sent: 0, skipped: 0, failed: 0 };
+
+  const paidAccessEnforced = await isPaidAccessEnforced();
+  const totals = { processed: 0, sent: 0, skipped: 0, failed: 0 };
+  for (const reminderSnapshot of reminders.docs) {
+    const reminderRef = reminderSnapshot.ref;
+    const claim = await db.runTransaction(async (transaction) => {
+      const currentReminder = await transaction.get(reminderRef);
+      if (!currentReminder.exists ||
+          currentReminder.data().remindAt.toDate() > now) {
+        return null;
+      }
+      const reminder = currentReminder.data();
+      const businessRef = db.collection('businesses').doc(reminder.businessId);
+      const appointmentRef = businessRef.collection('appointments')
+        .doc(reminder.appointmentId);
+      const [businessSnapshot, appointmentSnapshot] = await Promise.all([
+        transaction.get(businessRef),
+        transaction.get(appointmentRef),
+      ]);
+      if (!businessSnapshot.exists || !appointmentSnapshot.exists) {
+        transaction.delete(reminderRef);
+        return { skipped: true };
+      }
+      const business = businessSnapshot.data();
+      const appointment = appointmentSnapshot.data();
+      const settings = getCustomerEngagementSettings(business);
+      const customerRef = businessRef.collection('customers')
+        .doc(appointment.customerId);
+      const customerSnapshot = await transaction.get(customerRef);
+      if (!customerSnapshot.exists || appointment.status !== 'confirmed' ||
+          settings.customerReminderEnabled !== true ||
+          (paidAccessEnforced && !hasActivePosSubscription(business.subscription))) {
+        transaction.delete(reminderRef);
+        transaction.update(appointmentRef, {
+          customerReminderStatus: 'skipped',
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+        return { skipped: true };
+      }
+      const customer = customerSnapshot.data();
+      const channel = customer.serviceMessagesConsent === true
+        ? getAppointmentReminderChannel(customer, settings)
+        : null;
+      if (!channel) {
+        transaction.delete(reminderRef);
+        transaction.update(appointmentRef, {
+          customerReminderStatus: 'not_sent',
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+        return { skipped: true };
+      }
+      const attemptCount = (reminder.attemptCount || 0) + 1;
+      transaction.update(reminderRef, {
+        state: 'sending',
+        attemptCount,
+        remindAt: Timestamp.fromDate(new Date(now.getTime() + 5 * 60 * 1000)),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      transaction.update(appointmentRef, {
+        customerReminderStatus: 'sending',
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      return {
+        business,
+        businessId: reminder.businessId,
+        appointment,
+        appointmentId: reminder.appointmentId,
+        customer,
+        channel,
+        attemptCount,
+      };
+    });
+
+    if (!claim) continue;
+    totals.processed += 1;
+    if (claim.skipped) {
+      totals.skipped += 1;
+      continue;
+    }
+
+    try {
+      const localTime = new Intl.DateTimeFormat('es-CO', {
+        timeZone: claim.appointment.timeZone,
+        dateStyle: 'long',
+        timeStyle: 'short',
+      }).format(claim.appointment.startAt.toDate());
+      await sendBusinessMessage({
+        db,
+        businessId: claim.businessId,
+        customerId: claim.appointment.customerId,
+        customer: claim.customer,
+        channel: claim.channel,
+        text: `Recordatorio: tu cita de ${claim.appointment.serviceName} en ` +
+          `${claim.business.name || 'tu negocio'} es ${localTime} ` +
+          `(${claim.appointment.timeZone}).`,
+        senderUid: 'system:appointment-reminder',
+      });
+      await db.runTransaction(async (transaction) => {
+        const [currentReminder, currentAppointment] = await Promise.all([
+          transaction.get(reminderRef),
+          transaction.get(
+            db.collection('businesses').doc(claim.businessId)
+              .collection('appointments').doc(claim.appointmentId),
+          ),
+        ]);
+        if (!currentReminder.exists) return;
+        if (!currentAppointment.exists ||
+            currentAppointment.data().status !== 'confirmed') {
+          transaction.delete(reminderRef);
+          return;
+        }
+        transaction.update(reminderRef, {
+          state: 'sent',
+          remindAt: Timestamp.fromDate(new Date('9999-12-31T23:59:59.000Z')),
+          sentAt: FieldValue.serverTimestamp(),
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+        transaction.update(currentAppointment.ref, {
+          customerReminderStatus: 'sent',
+          customerReminderSentAt: FieldValue.serverTimestamp(),
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+      });
+      totals.sent += 1;
+    } catch (error) {
+      console.error('Scheduled customer appointment reminder failed:', error.message);
+      const retry = claim.attemptCount < 3;
+      const retryAt = retry
+        ? new Date(now.getTime() + 5 * 60 * 1000)
+        : new Date('9999-12-31T23:59:59.000Z');
+      await db.runTransaction(async (transaction) => {
+        const [currentReminder, currentAppointment] = await Promise.all([
+          transaction.get(reminderRef),
+          transaction.get(
+            db.collection('businesses').doc(claim.businessId)
+              .collection('appointments').doc(claim.appointmentId),
+          ),
+        ]);
+        if (!currentReminder.exists) return;
+        transaction.update(reminderRef, {
+          state: retry ? 'scheduled' : 'failed',
+          remindAt: Timestamp.fromDate(retryAt),
+          lastError: error.message.slice(0, 500),
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+        if (currentAppointment.exists) {
+          transaction.update(currentAppointment.ref, {
+            customerReminderStatus: retry ? 'retrying' : 'failed',
+            updatedAt: FieldValue.serverTimestamp(),
+          });
+        }
+      });
+      totals.failed += 1;
+    }
+  }
+  return totals;
+}
+
+app.post('/api/internal/appointment-reminders', async (req, res) => {
+  const configuredSecret = process.env.REMINDER_JOB_SECRET || '';
+  const suppliedSecret = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+  if (configuredSecret.length < 32) {
+    return res.status(503).json({ error: 'Reminder job authentication is not configured.' });
+  }
+  const expected = Buffer.from(configuredSecret);
+  const supplied = Buffer.from(suppliedSecret);
+  if (expected.length !== supplied.length ||
+      !crypto.timingSafeEqual(expected, supplied)) {
+    return res.status(401).json({ error: 'Unauthorized reminder job.' });
+  }
+  try {
+    res.json(await processDueAppointmentReminders(getFirestore()));
+  } catch (error) {
+    console.error('Scheduled appointment reminders could not be processed:', error);
+    res.status(500).json({ error: 'Unable to process scheduled appointment reminders.' });
+  }
+});
+
 app.get('/api/public/businesses/:slug',
   publicReadLimit, async (req, res) => {
     try {
@@ -1781,6 +2025,15 @@ app.post('/api/public/businesses/:slug/book',
         const status = liveSettings.bookingMode === 'auto_confirm'
           ? 'confirmed'
           : 'pending_vendor';
+        const customerReminderAt = status === 'confirmed'
+          ? enqueueCustomerAppointmentReminder(transaction, {
+            db,
+            businessId: business.businessId,
+            appointmentId: appointmentRef.id,
+            startAt,
+            settings: liveSettings,
+          })
+          : null;
         transaction.create(customerRef, customer);
         transaction.create(appointmentRef, {
           customerId: customerRef.id,
@@ -1794,6 +2047,10 @@ app.post('/api/public/businesses/:slug/book',
           endAt,
           bookingMode: liveSettings.bookingMode,
           status,
+          ...(customerReminderAt ? {
+            customerReminderAt,
+            customerReminderStatus: 'scheduled',
+          } : {}),
           source: 'public_booking',
           createdAt: FieldValue.serverTimestamp(),
           updatedAt: FieldValue.serverTimestamp(),
@@ -1806,6 +2063,7 @@ app.post('/api/public/businesses/:slug/book',
           service: liveService,
           timeZone: liveSettings.timeZone,
           bookingMode: liveSettings.bookingMode,
+          customerReminderScheduled: Boolean(customerReminderAt),
         };
       });
 
@@ -1825,6 +2083,7 @@ app.post('/api/public/businesses/:slug/book',
         bookingId: appointmentRef.id,
         status: booking.status,
         confirmationMessageStatus: confirmationStatus,
+        customerReminderScheduled: booking.customerReminderScheduled,
       });
     } catch (error) {
       console.error('Public appointment could not be booked:', error);
@@ -1957,12 +2216,102 @@ app.patch('/api/business/customers/:customerId/consent',
     }
   });
 
+app.get('/api/business/reminders',
+  requireFirebaseAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
+  requirePermission('charge'), requirePaidAccess, async (req, res) => {
+    try {
+      const snapshot = await getFirestore().collection('businesses')
+        .doc(req.businessId).collection('vendorReminders')
+        .orderBy('remindAt', 'asc').limit(200).get();
+      res.json({
+        reminders: snapshot.docs.map((reminder) => {
+          const data = reminder.data();
+          return {
+            id: reminder.id,
+            ...data,
+            remindAt: data.remindAt?.toDate?.().toISOString() || '',
+          };
+        }),
+      });
+    } catch (error) {
+      console.error('Vendor reminders could not be loaded:', error);
+      res.status(error.status || 500).json({ error: 'Unable to load reminders.' });
+    }
+  });
+
+app.post('/api/business/reminders',
+  requireFirebaseAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
+  requirePermission('charge'), requirePaidAccess, async (req, res) => {
+    const validationError = validateVendorReminder(req.body);
+    if (validationError) return res.status(400).json({ error: validationError });
+
+    try {
+      const reminder = {
+        title: req.body.title.trim(),
+        note: (req.body.note || '').trim(),
+        remindAt: Timestamp.fromDate(new Date(req.body.remindAt)),
+        completed: false,
+        createdBy: req.authUser.uid,
+        createdAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      };
+      const ref = await getFirestore().collection('businesses')
+        .doc(req.businessId).collection('vendorReminders').add(reminder);
+      res.status(201).json({
+        reminder: {
+          id: ref.id,
+          ...reminder,
+          remindAt: reminder.remindAt.toDate().toISOString(),
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        },
+      });
+    } catch (error) {
+      console.error('Vendor reminder could not be created:', error);
+      res.status(error.status || 500).json({ error: 'Unable to create reminder.' });
+    }
+  });
+
+app.patch('/api/business/reminders/:reminderId',
+  requireFirebaseAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
+  requirePermission('charge'), requirePaidAccess, async (req, res) => {
+    if (typeof req.body.completed !== 'boolean') {
+      return res.status(400).json({ error: 'Specify whether the reminder is complete.' });
+    }
+    try {
+      const ref = getFirestore().collection('businesses').doc(req.businessId)
+        .collection('vendorReminders').doc(req.params.reminderId);
+      const snapshot = await ref.get();
+      if (!snapshot.exists) {
+        return res.status(404).json({ error: 'Reminder not found.' });
+      }
+      await ref.update({
+        completed: req.body.completed,
+        ...(req.body.completed ? { completedAt: FieldValue.serverTimestamp() } : {
+          completedAt: FieldValue.delete(),
+        }),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      res.json({ id: snapshot.id, completed: req.body.completed });
+    } catch (error) {
+      console.error('Vendor reminder could not be updated:', error);
+      res.status(error.status || 500).json({ error: 'Unable to update reminder.' });
+    }
+  });
+
 app.get('/api/business/appointments',
   requireFirebaseAuth, requireBusinessMember, allowRoles('owner', 'cashier'),
   requirePermission('charge'), requirePaidAccess, async (req, res) => {
     try {
+      const recentFrom = Timestamp.fromDate(
+        new Date(Date.now() - 90 * 24 * 60 * 60 * 1000),
+      );
       const snapshot = await getFirestore().collection('businesses').doc(req.businessId)
-        .collection('appointments').orderBy('startAt', 'asc').limit(200).get();
+        .collection('appointments')
+        .where('startAt', '>=', recentFrom)
+        .orderBy('startAt', 'asc')
+        .limit(500)
+        .get();
       res.json({
         appointments: snapshot.docs.map((appointment) => {
           const data = appointment.data();
@@ -1971,6 +2320,7 @@ app.get('/api/business/appointments',
             ...data,
             startAt: data.startAt?.toDate?.().toISOString() || '',
             endAt: data.endAt?.toDate?.().toISOString() || '',
+            customerReminderAt: data.customerReminderAt?.toDate?.().toISOString() || '',
           };
         }),
       });
@@ -2069,6 +2419,15 @@ app.post('/api/business/appointments',
         const status = liveSettings.bookingMode === 'auto_confirm'
           ? 'confirmed'
           : 'pending_vendor';
+        const customerReminderAt = status === 'confirmed'
+          ? enqueueCustomerAppointmentReminder(transaction, {
+            db,
+            businessId: req.businessId,
+            appointmentId: appointmentRef.id,
+            startAt,
+            settings: liveSettings,
+          })
+          : null;
         transaction.create(appointmentRef, {
           customerId,
           customerName: customerSnapshot.data().name,
@@ -2081,6 +2440,10 @@ app.post('/api/business/appointments',
           endAt,
           bookingMode: liveSettings.bookingMode,
           status,
+          ...(customerReminderAt ? {
+            customerReminderAt,
+            customerReminderStatus: 'scheduled',
+          } : {}),
           createdBy: req.authUser.uid,
           createdAt: FieldValue.serverTimestamp(),
           updatedAt: FieldValue.serverTimestamp(),
@@ -2097,6 +2460,7 @@ app.post('/api/business/appointments',
           service: liveService,
           timeZone: liveSettings.timeZone,
           bookingMode: liveSettings.bookingMode,
+          customerReminderScheduled: Boolean(customerReminderAt),
         };
       });
       const notificationStatus = await notifyAppointmentCustomer(db, req.businessId, {
@@ -2116,6 +2480,7 @@ app.post('/api/business/appointments',
         status: booking.status,
         bookingMode: booking.bookingMode,
         notificationStatus,
+        customerReminderScheduled: booking.customerReminderScheduled,
       });
     } catch (error) {
       console.error('Appointment could not be booked:', error);
@@ -2138,6 +2503,9 @@ app.patch('/api/business/appointments/:appointmentId/status',
       const businessRef = db.collection('businesses').doc(req.businessId);
       const appointmentRef = businessRef.collection('appointments')
         .doc(req.params.appointmentId);
+      const reminderRef = getAppointmentReminderRef(
+        db, req.businessId, req.params.appointmentId,
+      );
       const snapshot = await appointmentRef.get();
       if (!snapshot.exists) {
         return res.status(404).json({ error: 'Appointment not found.' });
@@ -2159,16 +2527,40 @@ app.patch('/api/business/appointments/:appointmentId/status',
         businessRef.collection('appointmentSlots').doc(slotId),
       );
       await db.runTransaction(async (transaction) => {
-        const current = await transaction.get(appointmentRef);
+        const [current, liveBusiness, ...snapshots] = await Promise.all([
+          transaction.get(appointmentRef),
+          transaction.get(businessRef),
+          transaction.get(reminderRef),
+          ...slotRefs.map((slotRef) => transaction.get(slotRef)),
+        ]);
         if (!current.exists || current.data().status !== appointment.status) {
           const error = new Error('Appointment status changed; reload before trying again.');
           error.status = 409;
           throw error;
         }
-        const slots = await Promise.all(slotRefs.map((slotRef) => transaction.get(slotRef)));
+        const [currentReminder, ...slots] = snapshots;
+        const liveSettings = getCustomerEngagementSettings(liveBusiness.data() || {});
+        const customerReminderAt = nextStatus === 'confirmed'
+          ? enqueueCustomerAppointmentReminder(transaction, {
+            db,
+            businessId: req.businessId,
+            appointmentId: appointmentRef.id,
+            startAt: appointment.startAt.toDate(),
+            settings: liveSettings,
+          })
+          : null;
+        if (nextStatus !== 'confirmed' && currentReminder.exists) {
+          transaction.delete(reminderRef);
+        }
         transaction.update(appointmentRef, {
           status: nextStatus,
           updatedAt: FieldValue.serverTimestamp(),
+          ...(nextStatus === 'confirmed' ? {
+            customerReminderStatus: customerReminderAt ? 'scheduled' : 'not_scheduled',
+            ...(customerReminderAt ? { customerReminderAt } : {}),
+          } : {
+            customerReminderStatus: 'cancelled',
+          }),
           ...(nextStatus === 'confirmed' ? {
             confirmedBy: req.authUser.uid,
             confirmedAt: FieldValue.serverTimestamp(),

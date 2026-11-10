@@ -1,5 +1,6 @@
 const CHANNELS = new Set(['whatsapp', 'sms', 'email']);
 const WEEKDAYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
+const { validateReminderSettings } = require('./reminder-policy');
 
 function isValidTimezone(timeZone) {
   if (typeof timeZone !== 'string' || timeZone.length > 100) return false;
@@ -59,6 +60,8 @@ function validateCustomerEngagementSettings(settings) {
   if (settings.aiEnabled !== undefined && typeof settings.aiEnabled !== 'boolean') {
     return 'Specify whether the private AI assistant is enabled.';
   }
+  const reminderError = validateReminderSettings(settings);
+  if (reminderError) return reminderError;
 
   const hours = settings.weeklyHours;
   if (!hours || typeof hours !== 'object' || Array.isArray(hours) ||
